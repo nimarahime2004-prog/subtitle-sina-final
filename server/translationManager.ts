@@ -1,0 +1,845 @@
+import type { QueueRuntimeState, SubtitleCue } from '../src/shared/types.ts';
+import {
+  addLog,
+  db,
+  getCuesByFileId,
+  getFileById,
+  getGlossaryForProject,
+  getSettings,
+  recomputeFileStats,
+  resolveEffectiveTone,
+  type ProviderRow,
+} from './db.ts';
+import { ProviderApiError, translateBatchWithProvider } from './aiProviders.ts';
+import { analyzeCueQuality } from './subtitleEngine.ts';
+
+interface RateWindowEntry {
+  timestamp: number;
+  tokens: number;
+}
+
+/**
+ * Anti-Block Pacing Engine for Gemini & Multi-AI Providers:
+ * 1. Strict per-provider in-flight lock (max 1 concurrent request per API key)
+ *    so parallel files NEVER burst-collide on the same Gemini key.
+ * 2. Smooth minimum spacing + random jitter between requests derived from RPM
+ *    (with a 15% safety margin for Gemini anti-spam heuristics).
+ * 3. Rolling 60-second RPM & TPM budget enforcement.
+ * 4. Adaptive throttle multiplier if a provider ever reports 429.
+ */
+class AntiBlockRateLimiter {
+  private windows = new Map<number, RateWindowEntry[]>();
+  private lastRequestAt = new Map<number, number>();
+  private inFlight = new Set<number>();
+  private throttleMultiplier = new Map<number, number>();
+  private consecutive429 = new Map<number, number>();
+
+  private prune(providerId: number): RateWindowEntry[] {
+    const cutoff = Date.now() - 60_000;
+    const list = (this.windows.get(providerId) || []).filter(
+      (e) => e.timestamp >= cutoff
+    );
+    this.windows.set(providerId, list);
+    return list;
+  }
+
+  isBusy(providerId: number): boolean {
+    return this.inFlight.has(providerId);
+  }
+
+  async acquireSlot(
+    provider: ProviderRow,
+    estimatedTokens: number,
+    shouldAbort: () => boolean,
+    onWaitNote?: (note: string) => void
+  ): Promise<boolean> {
+    const isGemini =
+      provider.provider_type === 'gemini' ||
+      provider.provider_type === 'gemini_builtin';
+    // Conservative safety margin so Gemini never hits burst limits
+    const rpmLimit = Math.max(1, provider.rpm_limit || (isGemini ? 10 : 20));
+    const tpmLimit = Math.max(2000, provider.tpm_limit || 120000);
+    const mult = this.throttleMultiplier.get(provider.id) ?? 1.0;
+
+    // Evenly space requests across the minute + 15% safety margin for Gemini
+    const safetyFactor = isGemini ? 1.18 : 1.08;
+    const baseSpacingMs = Math.ceil((60_000 / rpmLimit) * safetyFactor * mult);
+
+    while (!shouldAbort()) {
+      // Wait for any in-flight request on this exact same API key to finish first
+      if (this.inFlight.has(provider.id)) {
+        if (onWaitNote) {
+          onWaitNote('انتظار برای اتمام درخواست قبلی روی همین کلید API (جلوگیری از بلاک)...');
+        }
+        await sleep(350);
+        continue;
+      }
+
+      const now = Date.now();
+      const last = this.lastRequestAt.get(provider.id) ?? 0;
+      const elapsedSinceLast = now - last;
+      if (last > 0 && elapsedSinceLast < baseSpacingMs) {
+        const remaining = baseSpacingMs - elapsedSinceLast;
+        if (onWaitNote && remaining > 1200) {
+          onWaitNote(
+            `فاصله‌گذاری هوشمند RPM برای جلوگیری از بلاک (${Math.ceil(remaining / 1000)} ثانیه)...`
+          );
+        }
+        await sleep(Math.min(remaining, 1500));
+        continue;
+      }
+
+      const list = this.prune(provider.id);
+      const currentRpm = list.length;
+      const currentTpm = list.reduce((sum, e) => sum + e.tokens, 0);
+
+      if (currentRpm < rpmLimit && currentTpm + estimatedTokens <= tpmLimit) {
+        // Add subtle organic jitter (250-750ms) so requests are never machine-burst synchronized
+        const jitter = 250 + Math.floor(Math.random() * 500);
+        if (last > 0) await sleep(jitter);
+        if (shouldAbort()) return false;
+
+        this.inFlight.add(provider.id);
+        this.lastRequestAt.set(provider.id, Date.now());
+        list.push({ timestamp: Date.now(), tokens: estimatedTokens });
+        this.windows.set(provider.id, list);
+        return true;
+      }
+
+      const oldest = list[0]?.timestamp ?? now;
+      const waitMs = Math.min(Math.max(500, 61_000 - (now - oldest)), 3000);
+      if (onWaitNote) {
+        onWaitNote(`کنترل سقف RPM/TPM (${currentRpm}/${rpmLimit} در دقیقه)...`);
+      }
+      await sleep(waitMs);
+    }
+
+    return false;
+  }
+
+  releaseSlot(providerId: number, actualTokens?: number): void {
+    this.inFlight.delete(providerId);
+    if (actualTokens && actualTokens > 0) {
+      const list = this.prune(providerId);
+      if (list.length > 0) {
+        list[list.length - 1].tokens = actualTokens;
+      }
+    }
+  }
+
+  recordSuccess(providerId: number): void {
+    this.consecutive429.set(providerId, 0);
+    const mult = this.throttleMultiplier.get(providerId) ?? 1.0;
+    if (mult > 1.0) {
+      this.throttleMultiplier.set(providerId, Math.max(1.0, mult - 0.1));
+    }
+  }
+
+  recordRateLimit(providerId: number, retryAfterSec?: number): number {
+    const count = (this.consecutive429.get(providerId) ?? 0) + 1;
+    this.consecutive429.set(providerId, count);
+    // Step down pacing speed automatically for this key so it stays below block threshold
+    const currMult = this.throttleMultiplier.get(providerId) ?? 1.0;
+    this.throttleMultiplier.set(providerId, Math.min(3.0, currMult * 1.45));
+
+    const expCooldownSec = Math.min(300, 60 * Math.pow(2, count - 1));
+    return Math.max(retryAfterSec ?? 0, expCooldownSec);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface EnqueueOptions {
+  fileIds: number[];
+  mode: 'pending' | 'repair' | 'selective';
+  selectedCueIds?: number[];
+  preferredProviderId?: number | null;
+}
+
+interface QueueJob {
+  fileId: number;
+  mode: 'pending' | 'repair' | 'selective';
+  selectedCueIds?: number[];
+  preferredProviderId?: number | null;
+}
+
+interface ActiveWorkerInfo {
+  fileId: number;
+  fileName: string;
+  providerName: string;
+  modelName: string;
+  batchProgress: string;
+  requestStartedAtMs?: number;
+  waitingNote?: string;
+}
+
+class TranslationQueueManager {
+  private state: QueueRuntimeState['state'] = 'idle';
+  private queue: QueueJob[] = [];
+  private activeWorkers = new Map<number, ActiveWorkerInfo>();
+  private totalProcessedInSession = 0;
+  private startedAt: string | null = null;
+  private rateLimiter = new AntiBlockRateLimiter();
+  private roundRobinOffset = 0;
+
+  getState(): QueueRuntimeState {
+    const now = Date.now();
+    const workers = Array.from(this.activeWorkers.values()).map((w) => {
+      let note = w.waitingNote;
+      if (w.requestStartedAtMs && now - w.requestStartedAtMs > 18_000) {
+        const sec = Math.floor((now - w.requestStartedAtMs) / 1000);
+        note =
+          w.waitingNote && w.waitingNote.includes('تدریجی')
+            ? w.waitingNote
+            : `پاسخ API کند است (${sec} ثانیه) — ادامه انتظار صبورانه بدون قطع اتصال...`;
+      }
+      return { ...w, waitingNote: note };
+    });
+
+    return {
+      state: this.state,
+      activeFileIds: Array.from(this.activeWorkers.keys()),
+      queuedFileIds: this.queue.map((q) => q.fileId),
+      activeWorkers: workers,
+      totalProcessedInSession: this.totalProcessedInSession,
+      startedAt: this.startedAt,
+    };
+  }
+
+  enqueue(options: EnqueueOptions): QueueRuntimeState {
+    const existingIds = new Set([
+      ...this.queue.map((q) => q.fileId),
+      ...this.activeWorkers.keys(),
+    ]);
+
+    for (const fileId of options.fileIds) {
+      if (existingIds.has(fileId)) continue;
+      const file = getFileById(fileId);
+      if (!file) continue;
+
+      this.queue.push({
+        fileId,
+        mode: options.mode,
+        selectedCueIds: options.selectedCueIds,
+        preferredProviderId: options.preferredProviderId,
+      });
+
+      db.prepare(
+        `UPDATE subtitle_files SET status = 'queued', last_error = NULL, updated_at = datetime('now') WHERE id = ?`
+      ).run(fileId);
+    }
+
+    if (this.queue.length > 0 && (this.state === 'idle' || this.state === 'paused')) {
+      this.state = 'running';
+      if (!this.startedAt) {
+        this.startedAt = new Date().toISOString();
+      }
+      this.pump();
+    }
+
+    return this.getState();
+  }
+
+  pause(): QueueRuntimeState {
+    if (this.state === 'running') {
+      this.state = 'paused';
+      addLog({
+        level: 'info',
+        category: 'queue',
+        message: 'صف ترجمه به حالت توقف موقت (Pause) در آمد.',
+      });
+    }
+    return this.getState();
+  }
+
+  resume(): QueueRuntimeState {
+    if (this.state === 'paused') {
+      this.state = 'running';
+      addLog({
+        level: 'info',
+        category: 'queue',
+        message: 'صف ترجمه مجدداً از سر گرفته شد (Resume).',
+      });
+      this.pump();
+    } else if (this.state === 'idle' && this.queue.length > 0) {
+      this.state = 'running';
+      this.pump();
+    }
+    return this.getState();
+  }
+
+  stop(): QueueRuntimeState {
+    this.state = 'stopping';
+    const dropped = this.queue.splice(0, this.queue.length);
+    for (const job of dropped) {
+      recomputeFileStats(job.fileId);
+    }
+    addLog({
+      level: 'warn',
+      category: 'queue',
+      message: 'دستور توقف کامل صف ترجمه صادر شد. تمام بخش‌های ترجمه‌شده در دیتابیس ذخیره مانده‌اند.',
+    });
+    if (this.activeWorkers.size === 0) {
+      this.state = 'idle';
+      this.startedAt = null;
+    }
+    return this.getState();
+  }
+
+  private pump(): void {
+    if (this.state !== 'running') return;
+    const settings = getSettings();
+    const concurrency = Math.max(1, Math.min(8, settings.maxConcurrentFiles || 2));
+
+    while (
+      this.state === 'running' &&
+      this.activeWorkers.size < concurrency &&
+      this.queue.length > 0
+    ) {
+      const nextJob = this.queue.shift()!;
+      void this.runFileWorker(nextJob);
+    }
+
+    if (this.activeWorkers.size === 0 && this.queue.length === 0) {
+      this.state = 'idle';
+      this.startedAt = null;
+    }
+  }
+
+  private getHealthyProviders(
+    preferredProviderId?: number | null,
+    excludeIds?: Set<number>
+  ): ProviderRow[] {
+    const nowIso = new Date().toISOString();
+    db.prepare(
+      `UPDATE api_providers
+       SET status = 'healthy', cooldown_until = NULL
+       WHERE status = 'cooldown' AND cooldown_until IS NOT NULL AND cooldown_until <= ?`
+    ).run(nowIso);
+
+    const rows = db
+      .prepare(
+        `SELECT * FROM api_providers
+         WHERE enabled = 1
+           AND (cooldown_until IS NULL OR cooldown_until <= ?)
+         ORDER BY priority ASC, id ASC`
+      )
+      .all(nowIso) as unknown as ProviderRow[];
+
+    const usable = rows.filter((p) => {
+      if (excludeIds?.has(p.id)) return false;
+      if (p.provider_type === 'gemini_builtin') {
+        return Boolean(process.env.GEMINI_API_KEY);
+      }
+      return Boolean(p.api_key) || p.provider_type === 'custom_proxy';
+    });
+
+    if (preferredProviderId) {
+      const idx = usable.findIndex((p) => p.id === preferredProviderId);
+      if (idx > 0) {
+        const [pref] = usable.splice(idx, 1);
+        usable.unshift(pref);
+      }
+      return usable;
+    }
+
+    // Prefer non-busy providers first so parallel files spread across distinct API keys!
+    const idleProviders = usable.filter((p) => !this.rateLimiter.isBusy(p.id));
+    const busyProviders = usable.filter((p) => this.rateLimiter.isBusy(p.id));
+    const ordered = [...idleProviders, ...busyProviders];
+
+    if (idleProviders.length > 1) {
+      const topPriority = idleProviders[0].priority;
+      const topGroup = idleProviders.filter((p) => p.priority === topPriority);
+      if (topGroup.length > 1) {
+        const shift = this.roundRobinOffset % topGroup.length;
+        this.roundRobinOffset += 1;
+        const rotated = [...topGroup.slice(shift), ...topGroup.slice(0, shift)];
+        const restIdle = idleProviders.filter((p) => p.priority !== topPriority);
+        return [...rotated, ...restIdle, ...busyProviders];
+      }
+    }
+
+    return ordered;
+  }
+
+  private isStopping(): boolean {
+    return this.state === 'stopping';
+  }
+
+  private isPaused(): boolean {
+    return this.state === 'paused';
+  }
+
+  private setWorkerNote(fileId: number, note: string | undefined): void {
+    const curr = this.activeWorkers.get(fileId);
+    if (curr) {
+      curr.waitingNote = note;
+      this.activeWorkers.set(fileId, curr);
+    }
+  }
+
+  private async runFileWorker(job: QueueJob): Promise<void> {
+    const file = getFileById(job.fileId);
+    if (!file) {
+      this.pump();
+      return;
+    }
+
+    const settings = getSettings();
+    const allCues = getCuesByFileId(file.id);
+    const { tone, customPrompt } = resolveEffectiveTone(file.id);
+    const glossary = getGlossaryForProject(file.projectId);
+
+    const targetCues = this.selectTargetCues(allCues, job);
+    if (targetCues.length === 0) {
+      recomputeFileStats(file.id);
+      this.pump();
+      return;
+    }
+
+    this.activeWorkers.set(file.id, {
+      fileId: file.id,
+      fileName: file.fileName,
+      providerName: 'در حال انتخاب API...',
+      modelName: '—',
+      batchProgress: `0 / ${targetCues.length}`,
+    });
+
+    db.prepare(
+      `UPDATE subtitle_files
+       SET status = 'translating', last_error = NULL, updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(file.id);
+
+    addLog({
+      level: 'info',
+      category: 'queue',
+      projectId: file.projectId,
+      fileId: file.id,
+      message: `شروع ترجمه فایل «${file.fileName}» (${targetCues.length} خط هدف، لحن: ${tone})`,
+    });
+
+    const batchSize = Math.max(4, Math.min(40, settings.batchSize || 18));
+    let processedForFile = 0;
+
+    try {
+      for (let offset = 0; offset < targetCues.length; offset += batchSize) {
+        while (this.isPaused()) {
+          db.prepare(
+            `UPDATE subtitle_files SET status = 'paused', updated_at = datetime('now') WHERE id = ?`
+          ).run(file.id);
+          await sleep(450);
+        }
+
+        if (this.isStopping()) {
+          break;
+        }
+
+        db.prepare(
+          `UPDATE subtitle_files SET status = 'translating', updated_at = datetime('now') WHERE id = ?`
+        ).run(file.id);
+
+        const batch = targetCues.slice(offset, offset + batchSize);
+        const firstIdx = batch[0].cueIndex;
+        const lastIdx = batch[batch.length - 1].cueIndex;
+
+        const contextBefore = allCues
+          .filter(
+            (c) =>
+              c.cueIndex >= firstIdx - settings.contextBefore &&
+              c.cueIndex < firstIdx
+          )
+          .map((c) => ({ cueIndex: c.cueIndex, sourceText: c.sourceText }));
+
+        const contextAfter = allCues
+          .filter(
+            (c) =>
+              c.cueIndex > lastIdx &&
+              c.cueIndex <= lastIdx + settings.contextAfter
+          )
+          .map((c) => ({ cueIndex: c.cueIndex, sourceText: c.sourceText }));
+
+        const markTranslating = db.prepare(
+          `UPDATE subtitle_cues SET status = 'translating' WHERE id = ?`
+        );
+        for (const c of batch) {
+          markTranslating.run(c.id);
+        }
+
+        const success = await this.executeBatchWithFailover({
+          file,
+          batch,
+          contextBefore,
+          contextAfter,
+          tone,
+          customPrompt,
+          glossary,
+          preferredProviderId: job.preferredProviderId,
+          preserveHtmlTags: settings.preserveHtmlTags,
+          maxRetries: settings.maxRetries || 4,
+          adaptiveTimeoutFloorMs: settings.adaptiveProxyTimeoutMs || 300_000,
+          processedBefore: processedForFile,
+          totalTargets: targetCues.length,
+        });
+
+        processedForFile += batch.length;
+        this.totalProcessedInSession += batch.length;
+
+        if (!success && this.isStopping()) {
+          break;
+        }
+      }
+    } finally {
+      this.activeWorkers.delete(file.id);
+      db.prepare(
+        `UPDATE subtitle_cues SET status = 'pending' WHERE file_id = ? AND status = 'translating'`
+      ).run(file.id);
+      db.prepare(
+        `UPDATE subtitle_files
+         SET active_provider_name = NULL, active_model_name = NULL,
+             status = CASE WHEN status = 'translating' THEN 'idle' ELSE status END
+         WHERE id = ?`
+      ).run(file.id);
+
+      const updated = recomputeFileStats(file.id);
+      if (updated && updated.status === 'completed') {
+        addLog({
+          level: 'success',
+          category: 'queue',
+          projectId: file.projectId,
+          fileId: file.id,
+          message: `ترجمه فایل «${file.fileName}» به صورت ۱۰۰٪ کامل شد (${updated.totalCues} خط، ${updated.totalTokens.toLocaleString()} توکن).`,
+          tokensUsed: updated.totalTokens,
+        });
+      }
+
+      if (this.isStopping() && this.activeWorkers.size === 0) {
+        this.state = 'idle';
+        this.startedAt = null;
+      } else {
+        this.pump();
+      }
+    }
+  }
+
+  private selectTargetCues(allCues: SubtitleCue[], job: QueueJob): SubtitleCue[] {
+    if (job.mode === 'selective' && job.selectedCueIds?.length) {
+      const idSet = new Set(job.selectedCueIds);
+      return allCues.filter((c) => idSet.has(c.id));
+    }
+    if (job.mode === 'repair') {
+      return allCues.filter(
+        (c) =>
+          c.status === 'pending' ||
+          c.status === 'error' ||
+          c.status === 'incomplete' ||
+          c.qaIssues.length > 0 ||
+          !c.translatedText.trim()
+      );
+    }
+    return allCues.filter(
+      (c) =>
+        c.status === 'pending' ||
+        c.status === 'error' ||
+        !c.translatedText.trim()
+    );
+  }
+
+  private async executeBatchWithFailover(params: {
+    file: ReturnType<typeof getFileById> & object;
+    batch: SubtitleCue[];
+    contextBefore: Array<{ cueIndex: number; sourceText: string }>;
+    contextAfter: Array<{ cueIndex: number; sourceText: string }>;
+    tone: ReturnType<typeof resolveEffectiveTone>['tone'];
+    customPrompt: string;
+    glossary: ReturnType<typeof getGlossaryForProject>;
+    preferredProviderId?: number | null;
+    preserveHtmlTags: boolean;
+    maxRetries: number;
+    adaptiveTimeoutFloorMs: number;
+    processedBefore: number;
+    totalTargets: number;
+  }): Promise<boolean> {
+    const triedInThisBatch = new Set<number>();
+    const estimatedTokens = Math.ceil(
+      params.batch.reduce((s, c) => s + c.sourceText.length, 0) / 2.2 + 500
+    );
+
+    for (let attempt = 0; attempt < params.maxRetries + 4; attempt++) {
+      if (this.isStopping()) return false;
+
+      let candidates = this.getHealthyProviders(
+        params.preferredProviderId,
+        triedInThisBatch
+      );
+
+      // If every provider is currently in cooldown, check soonest cooldown and wait safely instead of failing immediately
+      if (candidates.length === 0) {
+        triedInThisBatch.clear();
+        const soonest = db
+          .prepare(
+            `SELECT cooldown_until FROM api_providers
+             WHERE enabled = 1 AND status = 'cooldown' AND cooldown_until IS NOT NULL
+             ORDER BY cooldown_until ASC LIMIT 1`
+          )
+          .get() as { cooldown_until: string } | undefined;
+
+        if (soonest?.cooldown_until) {
+          const waitMs = Math.min(
+            Math.max(2000, Date.parse(soonest.cooldown_until) - Date.now() + 1000),
+            65_000
+          );
+          this.setWorkerNote(
+            params.file.id,
+            `همه APIها در استراحت Rate Limit هستند؛ ادامه خودکار تا ${Math.ceil(waitMs / 1000)} ثانیه دیگر...`
+          );
+          const steps = Math.ceil(waitMs / 1000);
+          for (let s = 0; s < steps && !this.isStopping(); s++) {
+            await sleep(1000);
+          }
+          candidates = this.getHealthyProviders(params.preferredProviderId);
+        }
+      }
+
+      if (candidates.length === 0) {
+        const msg =
+          'هیچ API فعال یا آماده به کاری در صف موجود نیست. لطفاً در بخش مدیریت APIها کلید معتبر فعال کنید.';
+        this.markBatchError(params.file.id, params.batch, msg);
+        addLog({
+          level: 'error',
+          category: 'api',
+          projectId: params.file.projectId,
+          fileId: params.file.id,
+          message: msg,
+        });
+        return false;
+      }
+
+      const provider = candidates[0];
+      triedInThisBatch.add(provider.id);
+
+      this.activeWorkers.set(params.file.id, {
+        fileId: params.file.id,
+        fileName: params.file.fileName,
+        providerName: provider.name,
+        modelName: provider.model_name,
+        batchProgress: `${Math.min(params.processedBefore + params.batch.length, params.totalTargets)} / ${params.totalTargets}`,
+        waitingNote: 'تنظیم نرخ RPM پیش از ارسال...',
+      });
+      db.prepare(
+        `UPDATE subtitle_files
+         SET active_provider_name = ?, active_model_name = ?, updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(provider.name, provider.model_name, params.file.id);
+
+      const acquired = await this.rateLimiter.acquireSlot(
+        provider,
+        estimatedTokens,
+        () => this.isStopping(),
+        (note) => this.setWorkerNote(params.file.id, note)
+      );
+      if (!acquired || this.isStopping()) return false;
+
+      // Mark exact send timestamp so slow-proxy elapsed UI works accurately
+      const worker = this.activeWorkers.get(params.file.id);
+      if (worker) {
+        worker.requestStartedAtMs = Date.now();
+        worker.waitingNote = 'در حال ارسال و دریافت پاسخ...';
+        this.activeWorkers.set(params.file.id, worker);
+      }
+
+      try {
+        const result = await translateBatchWithProvider({
+          provider,
+          tone: params.tone,
+          customTonePrompt: params.customPrompt,
+          glossary: params.glossary,
+          contextBefore: params.contextBefore,
+          targets: params.batch.map((c) => ({
+            cueIndex: c.cueIndex,
+            sourceText: c.sourceText,
+          })),
+          contextAfter: params.contextAfter,
+          preserveHtmlTags: params.preserveHtmlTags,
+          adaptiveTimeoutFloorMs: params.adaptiveTimeoutFloorMs,
+          onProgressNote: (note) => this.setWorkerNote(params.file.id, note),
+        });
+
+        this.rateLimiter.releaseSlot(provider.id, result.totalTokens);
+        this.rateLimiter.recordSuccess(provider.id);
+
+        const costUsd =
+          (result.inputTokens / 1_000_000) * (provider.input_price_per_1m || 0) +
+          (result.outputTokens / 1_000_000) * (provider.output_price_per_1m || 0);
+
+        const perCueTokens = Math.max(
+          1,
+          Math.round(result.totalTokens / Math.max(1, params.batch.length))
+        );
+
+        const updateCue = db.prepare(
+          `UPDATE subtitle_cues
+           SET translated_text = ?, status = ?, qa_issues_json = ?,
+               provider_used = ?, model_used = ?, tokens_used = ?,
+               updated_at = datetime('now')
+           WHERE id = ?`
+        );
+
+        db.exec('BEGIN');
+        try {
+          for (const cue of params.batch) {
+            const translated = result.translations.get(cue.cueIndex) ?? '';
+            if (translated.trim().length > 0) {
+              const issues = analyzeCueQuality(cue.sourceText, translated);
+              const nextStatus = issues.length > 0 ? 'incomplete' : 'done';
+              updateCue.run(
+                translated,
+                nextStatus,
+                JSON.stringify(issues),
+                provider.name,
+                result.modelUsed,
+                perCueTokens,
+                cue.id
+              );
+            } else {
+              const issues = analyzeCueQuality(cue.sourceText, '');
+              updateCue.run(
+                '',
+                'incomplete',
+                JSON.stringify(issues),
+                provider.name,
+                result.modelUsed,
+                0,
+                cue.id
+              );
+            }
+          }
+
+          db.prepare(
+            `UPDATE api_providers
+             SET status = 'healthy', last_latency_ms = ?, last_error = NULL,
+                 total_requests = total_requests + 1,
+                 total_tokens = total_tokens + ?,
+                 cooldown_until = NULL
+             WHERE id = ?`
+          ).run(result.latencyMs, result.totalTokens, provider.id);
+
+          db.prepare(
+            `UPDATE subtitle_files
+             SET estimated_cost_usd = estimated_cost_usd + ?, updated_at = datetime('now')
+             WHERE id = ?`
+          ).run(costUsd, params.file.id);
+
+          db.exec('COMMIT');
+        } catch (dbErr) {
+          db.exec('ROLLBACK');
+          throw dbErr;
+        }
+
+        recomputeFileStats(params.file.id);
+
+        addLog({
+          level: 'info',
+          category: 'api',
+          projectId: params.file.projectId,
+          fileId: params.file.id,
+          providerName: provider.name,
+          modelName: result.modelUsed,
+          message: `بسته ${params.batch.length} خطی از «${params.file.fileName}» ترجمه شد (${result.translations.size}/${params.batch.length} خط معتبر، زمان پاسخ ${(result.latencyMs / 1000).toFixed(1)}s).`,
+          tokensUsed: result.totalTokens,
+          latencyMs: result.latencyMs,
+        });
+
+        return true;
+      } catch (err) {
+        this.rateLimiter.releaseSlot(provider.id);
+
+        const apiErr =
+          err instanceof ProviderApiError
+            ? err
+            : new ProviderApiError(err instanceof Error ? err.message : String(err), {
+                retryable: true,
+              });
+
+        if (apiErr.isRateLimit) {
+          const cooldownSec = this.rateLimiter.recordRateLimit(
+            provider.id,
+            apiErr.retryAfterSec
+          );
+          const cooldownUntil = new Date(Date.now() + cooldownSec * 1000).toISOString();
+          db.prepare(
+            `UPDATE api_providers
+             SET status = 'cooldown', cooldown_until = ?, last_error = ?
+             WHERE id = ?`
+          ).run(cooldownUntil, apiErr.message, provider.id);
+
+          addLog({
+            level: 'warn',
+            category: 'api',
+            projectId: params.file.projectId,
+            fileId: params.file.id,
+            providerName: provider.name,
+            modelName: provider.model_name,
+            message: `محدودیت RPM/سهمیه در «${provider.name}» — استراحت ایمن ${cooldownSec} ثانیه‌ای و سوئیچ خودکار به API بعدی.`,
+          });
+        } else if (apiErr.isAuthError) {
+          db.prepare(
+            `UPDATE api_providers
+             SET status = 'error', last_error = ?
+             WHERE id = ?`
+          ).run(apiErr.message, provider.id);
+
+          addLog({
+            level: 'error',
+            category: 'api',
+            projectId: params.file.projectId,
+            fileId: params.file.id,
+            providerName: provider.name,
+            modelName: provider.model_name,
+            message: `خطای احراز هویت در «${provider.name}» — سوئیچ خودکار به API بعدی: ${apiErr.message}`,
+          });
+        } else {
+          const cooldownUntil = new Date(Date.now() + 20_000).toISOString();
+          db.prepare(
+            `UPDATE api_providers
+             SET status = 'cooldown', cooldown_until = ?, last_error = ?
+             WHERE id = ?`
+          ).run(cooldownUntil, apiErr.message, provider.id);
+
+          addLog({
+            level: 'warn',
+            category: 'api',
+            projectId: params.file.projectId,
+            fileId: params.file.id,
+            providerName: provider.name,
+            modelName: provider.model_name,
+            message: `تأخیر یا خطا در «${provider.name}» — سوئیچ خودکار به API بعدی: ${apiErr.message}`,
+          });
+        }
+      }
+    }
+
+    const finalMsg =
+      'تلاش‌های متعدد برای ترجمه این بسته ناموفق بود. با دکمه «تکمیل موارد ناقص» می‌توانید دوباره امتحان کنید.';
+    this.markBatchError(params.file.id, params.batch, finalMsg);
+    return false;
+  }
+
+  private markBatchError(fileId: number, batch: SubtitleCue[], message: string): void {
+    const stmt = db.prepare(
+      `UPDATE subtitle_cues SET status = 'error', updated_at = datetime('now') WHERE id = ?`
+    );
+    for (const c of batch) {
+      stmt.run(c.id);
+    }
+    db.prepare(
+      `UPDATE subtitle_files SET last_error = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(message, fileId);
+    recomputeFileStats(fileId);
+  }
+}
+
+export const translationManager = new TranslationQueueManager();

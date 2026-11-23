@@ -1,0 +1,6 @@
+{
+  "name": "AI Subtitle Translator",
+  "description": "نرم‌افزار حرفه‌ای ترجمه زیرنویس انگلیسی به فارسی (SRT و VTT) با حفظ ۱۰۰٪ زمان‌بندی، پشتیبانی از چند API، ادیتور دوزبانه و نسخه دسکتاپ پایتون.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
