@@ -366,14 +366,33 @@ export function EditorView({
                   <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
                   تایید Timecode
                 </button>
-                <a
-                  href={api.exportSingleFileUrl(effectiveFileId, false)}
-                  download
-                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:opacity-90 whitespace-nowrap"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  خروجی {fileMeta?.format.toUpperCase()}
-                </a>
+                <div className="inline-flex items-center rounded-lg overflow-hidden border border-slate-300 dark:border-slate-700 text-xs">
+                  <a
+                    href={api.exportSingleFileUrl(effectiveFileId, 'srt', false)}
+                    download
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 font-mono font-semibold bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:opacity-90 whitespace-nowrap"
+                    title="دانلود با فرمت SRT"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    SRT
+                  </a>
+                  <a
+                    href={api.exportSingleFileUrl(effectiveFileId, 'vtt', false)}
+                    download
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 font-mono font-semibold border-r border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap"
+                    title="دانلود با فرمت VTT"
+                  >
+                    VTT
+                  </a>
+                  <a
+                    href={api.exportSingleFileUrl(effectiveFileId, 'both', false)}
+                    download
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 font-medium border-r border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap"
+                    title="دانلود همزمان هر دو فرمت SRT و VTT (ZIP)"
+                  >
+                    هر دو (ZIP)
+                  </a>
+                </div>
               </>
             )}
           </div>

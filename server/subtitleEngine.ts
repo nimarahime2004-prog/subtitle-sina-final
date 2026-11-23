@@ -132,25 +132,90 @@ export interface SerializableCue {
   translatedText: string;
 }
 
+function formatMsToSrtTimestamp(ms: number): string {
+  const safe = Math.max(0, Math.round(ms));
+  const hours = Math.floor(safe / 3_600_000);
+  const minutes = Math.floor((safe % 3_600_000) / 60_000);
+  const seconds = Math.floor((safe % 60_000) / 1000);
+  const millis = safe % 1000;
+  return (
+    String(hours).padStart(2, '0') +
+    ':' +
+    String(minutes).padStart(2, '0') +
+    ':' +
+    String(seconds).padStart(2, '0') +
+    ',' +
+    String(millis).padStart(3, '0')
+  );
+}
+
+function convertTimecodeLineForFormat(
+  rawTimecodeLine: string,
+  sourceFormat: SubtitleFormat,
+  targetFormat: SubtitleFormat
+): string {
+  if (sourceFormat === targetFormat) {
+    // 100% byte-for-byte untouched original timecode line
+    return rawTimecodeLine;
+  }
+
+  const match = rawTimecodeLine.match(TIMECODE_LINE_REGEX);
+  if (!match) return rawTimecodeLine;
+
+  const rawStart = match[1].trim();
+  const rawEnd = match[2].trim();
+  const trailing = match[3] || '';
+
+  if (targetFormat === 'vtt') {
+    // SRT -> VTT: replace comma decimal separator with dot, keeping exact digits
+    const vttStart = rawStart.replace(',', '.');
+    const vttEnd = rawEnd.replace(',', '.');
+    return `${vttStart} --> ${vttEnd}${trailing}`;
+  }
+
+  // VTT -> SRT: guarantee HH:MM:SS,mmm format with comma separator and drop VTT positioning tags
+  const ensureHhMmSsComma = (ts: string): string => {
+    const clean = ts.replace('.', ',');
+    const parts = clean.split(':');
+    if (parts.length === 2) {
+      return `00:${parts[0].padStart(2, '0')}:${parts[1]}`;
+    }
+    if (parts.length === 3) {
+      return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}:${parts[2]}`;
+    }
+    return formatMsToSrtTimestamp(parseTimestampToMs(ts));
+  };
+
+  return `${ensureHhMmSsComma(rawStart)} --> ${ensureHhMmSsComma(rawEnd)}`;
+}
+
 /**
  * Rebuilds SRT or VTT strictly from the immutable stored fileHeader,
  * cueIdentifier, rawTimecodeLine, and lineEnding.
+ * Also supports cross-format export (SRT <-> VTT) with 100% preserved timing.
  */
 export function serializeSubtitleFile(params: {
   format: SubtitleFormat;
+  targetFormat?: SubtitleFormat;
   fileHeader: string;
   lineEnding: string;
   cues: SerializableCue[];
   fallbackToSource?: boolean;
   bilingual?: boolean;
 }): string {
+  const targetFormat: SubtitleFormat = params.targetFormat ?? params.format;
+  const isCrossFormat = targetFormat !== params.format;
   const eol = params.lineEnding === '\r\n' ? '\r\n' : '\n';
   const sorted = [...params.cues].sort((a, b) => a.cueIndex - b.cueIndex);
 
   const parts: string[] = [];
-  if (params.fileHeader && params.fileHeader.length > 0) {
-    parts.push(params.fileHeader.replace(/\r?\n/g, eol));
-  } else if (params.format === 'vtt') {
+  if (!isCrossFormat) {
+    if (params.fileHeader && params.fileHeader.length > 0) {
+      parts.push(params.fileHeader.replace(/\r?\n/g, eol));
+    } else if (targetFormat === 'vtt') {
+      parts.push('WEBVTT');
+    }
+  } else if (targetFormat === 'vtt') {
     parts.push('WEBVTT');
   }
 
@@ -168,13 +233,23 @@ export function serializeSubtitleFile(params: {
     }
 
     const lines: string[] = [];
-    if (cue.cueIdentifier && cue.cueIdentifier.length > 0) {
+    if (targetFormat === 'srt') {
+      if (!isCrossFormat && cue.cueIdentifier && cue.cueIdentifier.length > 0) {
+        lines.push(cue.cueIdentifier.replace(/\r?\n/g, eol));
+      } else {
+        lines.push(String(i + 1));
+      }
+    } else if (cue.cueIdentifier && cue.cueIdentifier.length > 0) {
       lines.push(cue.cueIdentifier.replace(/\r?\n/g, eol));
-    } else if (params.format === 'srt') {
-      lines.push(String(i + 1));
     }
-    // 100% untouched original raw timecode line
-    lines.push(cue.rawTimecodeLine);
+
+    lines.push(
+      convertTimecodeLineForFormat(
+        cue.rawTimecodeLine,
+        params.format,
+        targetFormat
+      )
+    );
     lines.push(bodyText.replace(/\r?\n/g, eol));
 
     parts.push(lines.join(eol));
@@ -197,13 +272,15 @@ export interface TimecodeIntegrityReport {
 }
 
 /**
- * Parses the generated subtitle output back and verifies byte-for-byte
- * that count, ordering, identifiers, and rawTimecodeLines are 100% identical.
+ * Parses the generated subtitle output back and verifies
+ * that count, ordering, and exact timestamps (byte-for-byte in same format,
+ * exact millisecond start/end across SRT <-> VTT) are 100% identical.
  */
 export function verifyTimecodeIntegrity(
   originalCues: SerializableCue[],
   exportedContent: string,
-  fileName: string
+  fileName: string,
+  crossFormat = false
 ): TimecodeIntegrityReport {
   const reparsed = parseSubtitleContent(exportedContent, fileName);
   const sorted = [...originalCues].sort((a, b) => a.cueIndex - b.cueIndex);
@@ -223,7 +300,21 @@ export function verifyTimecodeIntegrity(
       });
       continue;
     }
-    if (
+
+    if (crossFormat) {
+      const origMatch = orig.rawTimecodeLine.match(TIMECODE_LINE_REGEX);
+      const origStart = origMatch ? parseTimestampToMs(origMatch[1]) : -1;
+      const origEnd = origMatch ? parseTimestampToMs(origMatch[2]) : -1;
+      if (origStart !== exp.startMs || origEnd !== exp.endMs) {
+        mismatches.push({
+          cueIndex: i,
+          expectedTimecode: orig.rawTimecodeLine,
+          actualTimecode: exp.rawTimecodeLine,
+          expectedId: orig.cueIdentifier,
+          actualId: exp.cueIdentifier,
+        });
+      }
+    } else if (
       orig.rawTimecodeLine !== exp.rawTimecodeLine ||
       (orig.cueIdentifier && orig.cueIdentifier !== exp.cueIdentifier)
     ) {

@@ -207,17 +207,32 @@ export const api = {
   stopQueue: () =>
     requestJson<QueueRuntimeState>('/api/queue/stop', { method: 'POST' }),
 
-  // Export
-  exportSingleFileUrl: (fileId: number, bilingual = false) =>
-    `/api/files/${fileId}/export${bilingual ? '?bilingual=1' : ''}`,
+  // Export (SRT, VTT, or Both regardless of input format)
+  exportSingleFileUrl: (
+    fileId: number,
+    format: 'srt' | 'vtt' | 'both' | 'original' = 'original',
+    bilingual = false
+  ) => {
+    const params = new URLSearchParams();
+    if (format && format !== 'original') params.set('format', format);
+    if (bilingual) params.set('bilingual', '1');
+    const qs = params.toString();
+    return `/api/files/${fileId}/export${qs ? `?${qs}` : ''}`;
+  },
   exportZip: async (
     projectId: number,
-    body: { fileIds?: number[]; folderPath?: string; bilingual?: boolean }
+    body: {
+      fileIds?: number[];
+      folderPath?: string;
+      bilingual?: boolean;
+      exportFormat?: 'both' | 'srt' | 'vtt' | 'original';
+    }
   ): Promise<void> => {
+    const fmt = body.exportFormat || 'both';
     const res = await fetch(`/api/projects/${projectId}/export-zip`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, exportFormat: fmt }),
     });
     if (!res.ok) {
       throw new Error('خطا در تولید فایل خروجی ZIP');
@@ -226,7 +241,7 @@ export const api = {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `subtitles_fa_project_${projectId}.zip`;
+    a.download = `subtitles_fa_${fmt}_project_${projectId}.zip`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -263,7 +278,7 @@ export const api = {
     tpmLimit?: number;
     timeoutMs?: number;
   }) =>
-    requestJson<{ added: ApiProvider[]; count: number }>(
+    requestJson<{ added: ApiProvider[]; count: number; skippedDuplicates?: number }>(
       '/api/providers/bulk-import',
       {
         method: 'POST',
@@ -304,6 +319,7 @@ export const api = {
         latencyMs: number;
         tokensUsed: number;
         modelUsed: string;
+        fallbackFromModel?: string;
         sampleReply?: string;
         error?: string;
       };
@@ -355,12 +371,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-
-  // Python Desktop Package
-  getDesktopFiles: () =>
-    requestJson<{ files: Array<{ path: string; sizeBytes: number }> }>(
-      '/api/desktop/files'
-    ),
 };
 
 export async function readSelectedSubtitleFiles(

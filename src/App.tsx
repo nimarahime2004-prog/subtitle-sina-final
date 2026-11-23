@@ -50,12 +50,12 @@ const NAV_ITEMS: Array<{
   { id: 'providers', label: 'مدیریت APIها', icon: KeyRound },
   { id: 'glossary', label: 'واژه‌نامه اختصاصی', icon: BookMarked },
   { id: 'logs', label: 'گزارش‌ها و مصرف', icon: Activity },
-  { id: 'settings', label: 'تنظیمات و نسخه EXE', icon: Settings },
+  { id: 'settings', label: 'تنظیمات و پشتیبان‌گیری', icon: Settings },
 ];
 
 const DEFAULT_SETTINGS_CLIENT: AppSettings = {
   maxConcurrentFiles: 2,
-  batchSize: 18,
+  batchSize: 35,
   contextBefore: 4,
   contextAfter: 3,
   maxRetries: 4,
@@ -329,14 +329,6 @@ export default function App() {
             >
               {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
-
-            <a
-              href="/api/desktop/download-zip"
-              download
-              className="hidden sm:inline-flex items-center px-3.5 py-2 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors whitespace-nowrap shrink-0"
-            >
-              دریافت نسخه دسکتاپ Python
-            </a>
           </div>
         </header>
 
@@ -394,10 +386,14 @@ export default function App() {
                 await loadCoreData(activeProject?.id);
                 notify('فایل زیرنویس حذف شد.', 'info');
               }}
-              onExportAllZip={async () => {
+              onExportAllZip={async (exportFormat = 'both') => {
                 if (!activeProject) return;
-                await api.exportZip(activeProject.id, {});
-                notify('خروجی گروهی ZIP آماده دانلود شد.', 'success');
+                await api.exportZip(activeProject.id, { exportFormat });
+                const label =
+                  exportFormat === 'both'
+                    ? 'SRT + VTT'
+                    : exportFormat.toUpperCase();
+                notify(`خروجی گروهی ZIP (${label}) آماده دانلود شد.`, 'success');
               }}
             />
           )}

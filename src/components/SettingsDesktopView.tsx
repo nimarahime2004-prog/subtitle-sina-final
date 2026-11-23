@@ -1,10 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Archive,
-  Cpu,
   Download,
   HardDriveUpload,
   Save,
+  Server,
   Terminal,
 } from 'lucide-react';
 import type { AppSettings } from '../shared/types.ts';
@@ -25,19 +25,11 @@ export function SettingsDesktopView({
 }: SettingsDesktopViewProps) {
   const [form, setForm] = useState<AppSettings>(settings);
   const [saving, setSaving] = useState(false);
-  const [desktopFiles, setDesktopFiles] = useState<Array<{ path: string; sizeBytes: number }>>([]);
   const restoreInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setForm(settings);
   }, [settings]);
-
-  useEffect(() => {
-    api
-      .getDesktopFiles()
-      .then((res) => setDesktopFiles(res.files))
-      .catch(() => {});
-  }, []);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,7 +73,7 @@ export function SettingsDesktopView({
         <div className="flex items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-50">
-              تنظیمات موتور ترجمه موازی، Context و مدیریت خطا
+              تنظیمات موتور ترجمه موازی، Batch Size و تکمیل خودکار
             </h2>
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
               تمام تغییرات به صورت دائمی در دیتابیس SQLite ذخیره می‌شوند.
@@ -113,22 +105,25 @@ export function SettingsDesktopView({
               className="w-full"
             />
             <div className="mt-1 text-[11px] text-slate-500">
-              پیشنهاد: ۲ تا ۴ فایل همزمان برای تعادل بین سرعت و RPM
+              هر کلید Gemini حداکثر ۱ درخواست همزمان و ≤۱۰ درخواست در دقیقه می‌فرستد
             </div>
           </div>
 
           <div>
             <label className="block mb-1.5 font-medium text-slate-700 dark:text-slate-300">
-              تعداد خطوط در هر بسته ارسالی (Batch Size)
+              تعداد ردیف در هر درخواست (Batch Size)
             </label>
             <input
               type="number"
               min={4}
-              max={40}
+              max={80}
               value={form.batchSize}
               onChange={(e) => setForm({ ...form, batchSize: Number(e.target.value) })}
               className="w-full px-3 py-2 rounded-lg font-mono bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700"
             />
+            <div className="mt-1 text-[11px] text-slate-500">
+              پیش‌فرض: ۳۵ ردیف در هر بسته (قابل تغییر دستی از ۴ تا ۸۰ ردیف)
+            </div>
           </div>
 
           <div>
@@ -219,7 +214,7 @@ export function SettingsDesktopView({
                 setForm({ ...form, autoRepairIncomplete: e.target.checked })
               }
             />
-            علامت‌گذاری خودکار ترجمه‌های ناقص یا انگلیسی باقیمانده
+            تکمیل خودکار ترجمه‌های ناقص، خالی یا انگلیسی‌مانده تا ۱۰۰٪ پیش از رفتن به فایل بعدی
           </label>
         </div>
       </form>
@@ -264,63 +259,39 @@ export function SettingsDesktopView({
         </div>
       </div>
 
-      {/* Python Desktop App (PySide6) + Windows EXE Builder Package */}
+      {/* Node.js Localhost Execution Guide */}
       <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-50 flex items-center gap-2">
-              <Cpu className="w-4 h-4 text-blue-500" />
-              نسخه دسکتاپ پایتون (PySide6 + SQLite) و ساخت فایل EXE ویندوز
-            </h3>
-            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              کد کامل و ماژولار نسخه دسکتاپ Python به همراه تست‌های واحد تاییدشده (`unittest`) و اسکریپت ساخت نسخه اجرایی تک‌فایل ویندوز (`PyInstaller`) آماده دانلود است.
-            </p>
-          </div>
-          <a
-            href="/api/desktop/download-zip"
-            download
-            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white whitespace-nowrap shrink-0"
-          >
-            <Download className="w-3.5 h-3.5" />
-            دانلود پکیج کامل Python + EXE Builder (ZIP)
-          </a>
+        <div>
+          <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-50 flex items-center gap-2">
+            <Server className="w-4 h-4 text-blue-500" />
+            اجرای محلی با Node.js روی Localhost
+          </h3>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            این برنامه کاملاً روی Node.js (نسخه ۲۲.۵ به بالا با SQLite داخلی) اجرا می‌شود و بدون نیاز به نصب دیتابیس یا نسخه EXE می‌توانید آن را روی کامپیوتر شخصی خود روی آدرس{' '}
+            <span className="font-mono text-slate-700 dark:text-slate-200" dir="ltr">
+              http://localhost:3000
+            </span>{' '}
+            بالا بیاورید.
+          </p>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-2">
-          <div className="p-4 rounded-lg bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800">
-            <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 mb-2 flex items-center gap-1.5">
-              <Terminal className="w-3.5 h-3.5 text-slate-500" />
-              دستورات اجرا و ساخت EXE در ویندوز
-            </div>
-            <pre
-              dir="ltr"
-              className="text-[11px] font-mono leading-5 text-slate-700 dark:text-slate-300 overflow-x-auto"
-            >{`# 1. Run unit tests (SRT/VTT 100% immutable timecodes)
-python -m unittest discover -s tests -v
-
-# 2. Run PySide6 Desktop App
-pip install -r requirements.txt
-python main.py
-
-# 3. Build standalone Windows EXE (dist/AI_Subtitle_Translator.exe)
-build_exe.bat`}</pre>
+        <div className="p-4 rounded-lg bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800">
+          <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 mb-2 flex items-center gap-1.5">
+            <Terminal className="w-3.5 h-3.5 text-slate-500" />
+            دستورات نصب و اجرا روی Localhost
           </div>
+          <pre
+            dir="ltr"
+            className="text-[11px] font-mono leading-5 text-slate-700 dark:text-slate-300 overflow-x-auto"
+          >{`# 1. Install dependencies (Node.js 22.5+ required)
+npm install
 
-          <div className="p-4 rounded-lg bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800">
-            <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 mb-2">
-              ساختار ماژولار فایل‌های پکیج دسکتاپ ({desktopFiles.length} فایل)
-            </div>
-            <div className="max-h-36 overflow-y-auto space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400" dir="ltr">
-              {desktopFiles.map((f) => (
-                <div key={f.path} className="flex items-center justify-between gap-2">
-                  <span className="truncate">{f.path}</span>
-                  <span className="tabular-nums shrink-0 text-slate-400">
-                    {(f.sizeBytes / 1024).toFixed(1)} KB
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
+# 2. Run directly on http://localhost:3000
+npm run dev
+
+# 3. Or build & run in production mode
+npm run build
+npm start`}</pre>
         </div>
       </div>
     </div>

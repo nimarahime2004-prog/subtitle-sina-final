@@ -17,7 +17,7 @@ import type {
   DashboardSummary,
   SubtitleFile,
 } from '../shared/types.ts';
-import { readSelectedSubtitleFiles } from '../lib/api.ts';
+import { api, readSelectedSubtitleFiles } from '../lib/api.ts';
 
 interface DashboardViewProps {
   summary: DashboardSummary | null;
@@ -32,7 +32,7 @@ interface DashboardViewProps {
   onStopQueue: () => Promise<void>;
   onOpenEditor: (fileId: number) => void;
   onDeleteFile: (fileId: number) => Promise<void>;
-  onExportAllZip: () => Promise<void>;
+  onExportAllZip: (exportFormat?: 'both' | 'srt' | 'vtt' | 'original') => Promise<void>;
 }
 
 const FILE_STATUS_LABELS: Record<SubtitleFile['status'], { label: string; tone: string }> = {
@@ -63,6 +63,7 @@ export function DashboardView({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [exportFormat, setExportFormat] = useState<'both' | 'srt' | 'vtt' | 'original'>('both');
 
   const queue = summary?.queue;
   const isRunning = queue?.state === 'running';
@@ -294,14 +295,31 @@ export function DashboardView({
             )}
 
             {files.length > 0 && (
-              <button
-                type="button"
-                onClick={onExportAllZip}
-                className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Download className="w-3.5 h-3.5" />
-                خروجی ZIP با پوشه‌ها
-              </button>
+              <div className="inline-flex items-center rounded-lg border border-slate-300 dark:border-slate-700 overflow-hidden shrink-0">
+                <select
+                  value={exportFormat}
+                  onChange={(e) =>
+                    setExportFormat(
+                      e.target.value as 'both' | 'srt' | 'vtt' | 'original'
+                    )
+                  }
+                  className="px-2.5 py-2 text-xs bg-slate-50 dark:bg-slate-900 text-slate-700 dark:text-slate-200 border-l border-slate-300 dark:border-slate-700 focus:outline-none"
+                  title="فرمت خروجی ZIP"
+                >
+                  <option value="both">SRT + VTT</option>
+                  <option value="srt">فقط SRT</option>
+                  <option value="vtt">فقط VTT</option>
+                  <option value="original">فرمت اصلی</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={() => onExportAllZip(exportFormat)}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  خروجی ZIP
+                </button>
+              </div>
             )}
           </div>
         </div>
@@ -506,6 +524,23 @@ export function DashboardView({
                           >
                             ترجمه
                           </button>
+                          <span className="text-slate-300 dark:text-slate-700">·</span>
+                          <a
+                            href={api.exportSingleFileUrl(file.id, 'srt')}
+                            download
+                            className="font-mono text-[11px] text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400"
+                            title="دانلود SRT"
+                          >
+                            SRT
+                          </a>
+                          <a
+                            href={api.exportSingleFileUrl(file.id, 'vtt')}
+                            download
+                            className="font-mono text-[11px] text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400"
+                            title="دانلود VTT"
+                          >
+                            VTT
+                          </a>
                           <span className="text-slate-300 dark:text-slate-700">·</span>
                           {confirmDeleteId === file.id ? (
                             <>

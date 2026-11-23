@@ -56,13 +56,15 @@ class AntiBlockRateLimiter {
     const isGemini =
       provider.provider_type === 'gemini' ||
       provider.provider_type === 'gemini_builtin';
-    // Conservative safety margin so Gemini never hits burst limits
-    const rpmLimit = Math.max(1, provider.rpm_limit || (isGemini ? 10 : 20));
+    // Strict hard ceiling: never exceed 10 requests/min per Gemini API key
+    const rpmLimit = isGemini
+      ? Math.min(10, Math.max(1, provider.rpm_limit || 10))
+      : Math.max(1, provider.rpm_limit || 20);
     const tpmLimit = Math.max(2000, provider.tpm_limit || 120000);
     const mult = this.throttleMultiplier.get(provider.id) ?? 1.0;
 
-    // Evenly space requests across the minute + 15% safety margin for Gemini
-    const safetyFactor = isGemini ? 1.18 : 1.08;
+    // Evenly space requests across the minute + safety margin (~6.7s minimum per Gemini key at 10 RPM)
+    const safetyFactor = isGemini ? 1.12 : 1.08;
     const baseSpacingMs = Math.ceil((60_000 / rpmLimit) * safetyFactor * mult);
 
     while (!shouldAbort()) {
@@ -422,11 +424,19 @@ class TranslationQueueManager {
       message: `شروع ترجمه فایل «${file.fileName}» (${targetCues.length} خط هدف، لحن: ${tone})`,
     });
 
-    const batchSize = Math.max(4, Math.min(40, settings.batchSize || 18));
+    const batchSize = Math.max(4, Math.min(80, settings.batchSize || 35));
     let processedForFile = 0;
 
-    try {
-      for (let offset = 0; offset < targetCues.length; offset += batchSize) {
+    const processCueList = async (
+      cuesToTranslate: SubtitleCue[],
+      effectiveBatchSize: number,
+      phaseLabel?: string
+    ): Promise<boolean> => {
+      let anySucceeded = false;
+      let phaseProcessed = 0;
+      const latestAll = getCuesByFileId(file.id);
+
+      for (let offset = 0; offset < cuesToTranslate.length; offset += effectiveBatchSize) {
         while (this.isPaused()) {
           db.prepare(
             `UPDATE subtitle_files SET status = 'paused', updated_at = datetime('now') WHERE id = ?`
@@ -442,11 +452,11 @@ class TranslationQueueManager {
           `UPDATE subtitle_files SET status = 'translating', updated_at = datetime('now') WHERE id = ?`
         ).run(file.id);
 
-        const batch = targetCues.slice(offset, offset + batchSize);
+        const batch = cuesToTranslate.slice(offset, offset + effectiveBatchSize);
         const firstIdx = batch[0].cueIndex;
         const lastIdx = batch[batch.length - 1].cueIndex;
 
-        const contextBefore = allCues
+        const contextBefore = latestAll
           .filter(
             (c) =>
               c.cueIndex >= firstIdx - settings.contextBefore &&
@@ -454,7 +464,7 @@ class TranslationQueueManager {
           )
           .map((c) => ({ cueIndex: c.cueIndex, sourceText: c.sourceText }));
 
-        const contextAfter = allCues
+        const contextAfter = latestAll
           .filter(
             (c) =>
               c.cueIndex > lastIdx &&
@@ -481,15 +491,73 @@ class TranslationQueueManager {
           preserveHtmlTags: settings.preserveHtmlTags,
           maxRetries: settings.maxRetries || 4,
           adaptiveTimeoutFloorMs: settings.adaptiveProxyTimeoutMs || 300_000,
-          processedBefore: processedForFile,
-          totalTargets: targetCues.length,
+          processedBefore: phaseLabel ? phaseProcessed : processedForFile,
+          totalTargets: phaseLabel ? cuesToTranslate.length : targetCues.length,
+          phaseLabel,
         });
 
+        if (success) anySucceeded = true;
+        phaseProcessed += batch.length;
         processedForFile += batch.length;
         this.totalProcessedInSession += batch.length;
 
         if (!success && this.isStopping()) {
           break;
+        }
+      }
+
+      return anySucceeded;
+    };
+
+    try {
+      await processCueList(targetCues, batchSize);
+
+      // Automatic multi-pass completion of any missing/incomplete/English-leftover lines BEFORE moving to the next file
+      if (
+        !this.isStopping() &&
+        job.mode !== 'selective' &&
+        settings.autoRepairIncomplete !== false
+      ) {
+        const MAX_AUTO_REPAIR_PASSES = 3;
+        for (let pass = 1; pass <= MAX_AUTO_REPAIR_PASSES; pass++) {
+          if (this.isStopping()) break;
+
+          const currentCues = getCuesByFileId(file.id);
+          const missingOrIncomplete = currentCues.filter((c) => {
+            if (!c.sourceText.replace(/<[^>]+>/g, '').trim()) return false;
+            if (!c.translatedText.trim()) return true;
+            if (
+              c.status === 'pending' ||
+              c.status === 'error' ||
+              c.status === 'incomplete'
+            ) {
+              return true;
+            }
+            return analyzeCueQuality(c.sourceText, c.translatedText).length > 0;
+          });
+
+          if (missingOrIncomplete.length === 0) {
+            break;
+          }
+
+          addLog({
+            level: 'info',
+            category: 'qa',
+            projectId: file.projectId,
+            fileId: file.id,
+            message: `تکمیل خودکار ${missingOrIncomplete.length} ردیف ناقص یا جاافتاده در «${file.fileName}» (دور ${pass} از ${MAX_AUTO_REPAIR_PASSES}) پیش از رفتن به فایل بعدی...`,
+          });
+
+          const repairBatchSize = Math.min(batchSize, 15);
+          const repairedAny = await processCueList(
+            missingOrIncomplete,
+            repairBatchSize,
+            `تکمیل خودکار ناقص‌ها (دور ${pass}/${MAX_AUTO_REPAIR_PASSES})`
+          );
+
+          if (!repairedAny) {
+            break;
+          }
         }
       }
     } finally {
@@ -562,6 +630,7 @@ class TranslationQueueManager {
     adaptiveTimeoutFloorMs: number;
     processedBefore: number;
     totalTargets: number;
+    phaseLabel?: string;
   }): Promise<boolean> {
     const triedInThisBatch = new Set<number>();
     const estimatedTokens = Math.ceil(
@@ -627,7 +696,9 @@ class TranslationQueueManager {
         providerName: provider.name,
         modelName: provider.model_name,
         batchProgress: `${Math.min(params.processedBefore + params.batch.length, params.totalTargets)} / ${params.totalTargets}`,
-        waitingNote: 'تنظیم نرخ RPM پیش از ارسال...',
+        waitingNote: params.phaseLabel
+          ? `${params.phaseLabel} — تنظیم نرخ RPM...`
+          : 'تنظیم نرخ RPM پیش از ارسال...',
       });
       db.prepare(
         `UPDATE subtitle_files
@@ -741,6 +812,21 @@ class TranslationQueueManager {
 
         recomputeFileStats(params.file.id);
 
+        if (result.fallbackFromModel) {
+          db.prepare(
+            `UPDATE subtitle_files SET active_model_name = ? WHERE id = ?`
+          ).run(result.modelUsed, params.file.id);
+          addLog({
+            level: 'warn',
+            category: 'api',
+            projectId: params.file.projectId,
+            fileId: params.file.id,
+            providerName: provider.name,
+            modelName: result.modelUsed,
+            message: `مدل ${result.fallbackFromModel} با خطای 503/شلوغی مواجه شد — سوئیچ خودکار به ${result.modelUsed} با موفقیت انجام شد.`,
+          });
+        }
+
         addLog({
           level: 'info',
           category: 'api',
@@ -748,7 +834,7 @@ class TranslationQueueManager {
           fileId: params.file.id,
           providerName: provider.name,
           modelName: result.modelUsed,
-          message: `بسته ${params.batch.length} خطی از «${params.file.fileName}» ترجمه شد (${result.translations.size}/${params.batch.length} خط معتبر، زمان پاسخ ${(result.latencyMs / 1000).toFixed(1)}s).`,
+          message: `${params.phaseLabel ? `[${params.phaseLabel}] ` : ''}بسته ${params.batch.length} خطی از «${params.file.fileName}» ترجمه شد (${result.translations.size}/${params.batch.length} خط معتبر، زمان پاسخ ${(result.latencyMs / 1000).toFixed(1)}s).`,
           tokensUsed: result.totalTokens,
           latencyMs: result.latencyMs,
         });

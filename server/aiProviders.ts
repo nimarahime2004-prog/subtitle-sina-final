@@ -28,6 +28,7 @@ export interface TranslationBatchResult {
   totalTokens: number;
   latencyMs: number;
   modelUsed: string;
+  fallbackFromModel?: string;
 }
 
 export interface ProviderTestResult {
@@ -35,6 +36,7 @@ export interface ProviderTestResult {
   latencyMs: number;
   tokensUsed: number;
   modelUsed: string;
+  fallbackFromModel?: string;
   sampleReply?: string;
   error?: string;
   statusCode?: number;
@@ -75,12 +77,36 @@ export const DEFAULT_BASE_URLS: Record<string, string> = {
 };
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+export const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
 const VALID_GEMINI_MODELS = [
   'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
   'gemini-4-hydrogen',
 ];
+
+// Tracks temporary 503/UNAVAILABLE demand spikes on gemini-3.5-flash-lite (auto-recovers after 2 min)
+let gemini35SpikeUntilMs = 0;
+
+function isModelUnavailableOrOverloaded(err: ProviderApiError): boolean {
+  const lower = err.message.toLowerCase();
+  return (
+    err.statusCode === 503 ||
+    err.statusCode === 500 ||
+    err.statusCode === 502 ||
+    err.statusCode === 504 ||
+    err.statusCode === 404 ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('not_found') ||
+    lower.includes('not found')
+  );
+}
+
+function shouldTryGeminiFallback(primaryModel: string): boolean {
+  return primaryModel.trim().toLowerCase() !== FALLBACK_GEMINI_MODEL;
+}
 
 /**
  * Computes a generous adaptive timeout so slow relay/proxy APIs never trigger
@@ -460,14 +486,15 @@ export async function translateBatchWithProvider(
     req.provider.provider_type === 'gemini'
   ) {
     const ai = getGeminiClient(req.provider, effectiveTimeoutMs);
-    const modelName = req.provider.model_name || DEFAULT_GEMINI_MODEL;
-    const supportsThinkingLevel =
-      modelName === 'gemini-4-hydrogen' ||
-      modelName === 'gemini-4-neon' ||
-      modelName === 'gemini-4-argon' ||
-      modelName === 'gemini-4-carbon';
+    const configuredModel = (req.provider.model_name || DEFAULT_GEMINI_MODEL).trim();
 
-    try {
+    const invokeGemini = async (targetModel: string) => {
+      const supportsThinkingLevel =
+        targetModel === 'gemini-4-hydrogen' ||
+        targetModel === 'gemini-4-neon' ||
+        targetModel === 'gemini-4-argon' ||
+        targetModel === 'gemini-4-carbon';
+
       const config: Record<string, unknown> = {
         systemInstruction,
         responseMimeType: 'application/json',
@@ -495,7 +522,7 @@ export async function translateBatchWithProvider(
       }
 
       const response = await ai.models.generateContent({
-        model: modelName,
+        model: targetModel,
         contents: userContent,
         config,
       });
@@ -514,11 +541,54 @@ export async function translateBatchWithProvider(
         outputTokens,
         totalTokens,
         latencyMs,
-        modelUsed: modelName,
+        modelUsed: targetModel,
       };
+    };
+
+    // If gemini-3.5-flash-lite recently hit a 503 demand spike, use gemini-3.1-flash-lite directly during the 2-min cooldown
+    const isPrimary35 = configuredModel === DEFAULT_GEMINI_MODEL;
+    if (isPrimary35 && Date.now() < gemini35SpikeUntilMs) {
+      req.onProgressNote?.(
+        `سوئیچ موقت روی ${FALLBACK_GEMINI_MODEL} به دلیل شلوغی اخیر ${DEFAULT_GEMINI_MODEL}...`
+      );
+      try {
+        const res = await invokeGemini(FALLBACK_GEMINI_MODEL);
+        return { ...res, fallbackFromModel: configuredModel };
+      } catch (err) {
+        if (err instanceof ProviderApiError) throw err;
+        throw classifyGeminiError(err);
+      }
+    }
+
+    try {
+      return await invokeGemini(configuredModel);
     } catch (err) {
-      if (err instanceof ProviderApiError) throw err;
-      throw classifyGeminiError(err);
+      const apiErr =
+        err instanceof ProviderApiError ? err : classifyGeminiError(err);
+
+      // Automatic instant fallback from gemini-3.5-flash-lite -> gemini-3.1-flash-lite on 503 UNAVAILABLE / high demand / model failure
+      if (
+        shouldTryGeminiFallback(configuredModel) &&
+        !apiErr.isAuthError &&
+        !apiErr.isRateLimit &&
+        isModelUnavailableOrOverloaded(apiErr)
+      ) {
+        if (isPrimary35) {
+          gemini35SpikeUntilMs = Date.now() + 120_000;
+        }
+        req.onProgressNote?.(
+          `خطای ${apiErr.statusCode} در ${configuredModel} — سوئیچ خودکار به ${FALLBACK_GEMINI_MODEL}...`
+        );
+        try {
+          const fallbackRes = await invokeGemini(FALLBACK_GEMINI_MODEL);
+          return { ...fallbackRes, fallbackFromModel: configuredModel };
+        } catch (fbErr) {
+          if (fbErr instanceof ProviderApiError) throw fbErr;
+          throw classifyGeminiError(fbErr);
+        }
+      }
+
+      throw apiErr;
     }
   }
 
@@ -666,22 +736,47 @@ export async function testProviderConnection(
       provider.provider_type === 'gemini'
     ) {
       const ai = getGeminiClient(provider, timeoutMs);
-      const modelName = provider.model_name || DEFAULT_GEMINI_MODEL;
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents:
-          'Translate to crisp, direct documentary Persian (only the translation, nothing else): "Every signal leaves a trace."',
-      });
-      const latencyMs = Date.now() - startedAt;
-      const reply = (response.text ?? '').trim();
-      const tokensUsed = response.usageMetadata?.totalTokenCount ?? 0;
-      return {
-        ok: true,
-        latencyMs,
-        tokensUsed,
-        modelUsed: modelName,
-        sampleReply: reply,
-      };
+      const modelName = (provider.model_name || DEFAULT_GEMINI_MODEL).trim();
+      const prompt =
+        'Translate to crisp, direct documentary Persian (only the translation, nothing else): "Every signal leaves a trace."';
+
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: prompt,
+        });
+        const latencyMs = Date.now() - startedAt;
+        return {
+          ok: true,
+          latencyMs,
+          tokensUsed: response.usageMetadata?.totalTokenCount ?? 0,
+          modelUsed: modelName,
+          sampleReply: (response.text ?? '').trim(),
+        };
+      } catch (primaryErr) {
+        const apiErr = classifyGeminiError(primaryErr);
+        if (
+          shouldTryGeminiFallback(modelName) &&
+          !apiErr.isAuthError &&
+          !apiErr.isRateLimit &&
+          isModelUnavailableOrOverloaded(apiErr)
+        ) {
+          const fallbackRes = await ai.models.generateContent({
+            model: FALLBACK_GEMINI_MODEL,
+            contents: prompt,
+          });
+          const latencyMs = Date.now() - startedAt;
+          return {
+            ok: true,
+            latencyMs,
+            tokensUsed: fallbackRes.usageMetadata?.totalTokenCount ?? 0,
+            modelUsed: FALLBACK_GEMINI_MODEL,
+            fallbackFromModel: modelName,
+            sampleReply: (fallbackRes.text ?? '').trim(),
+          };
+        }
+        throw apiErr;
+      }
     }
 
     const baseUrl = (

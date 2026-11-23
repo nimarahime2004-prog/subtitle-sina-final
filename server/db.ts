@@ -152,7 +152,7 @@ db.exec(`
 
 export const DEFAULT_SETTINGS: AppSettings = {
   maxConcurrentFiles: 2,
-  batchSize: 18,
+  batchSize: 35,
   contextBefore: 4,
   contextAfter: 3,
   maxRetries: 4,
@@ -204,7 +204,7 @@ function initDefaultsAndCrashRecovery(): void {
     }
   }
 
-  // Ensure built-in server Gemini provider defaults to gemini-3.5-flash-lite with safe anti-block RPM (10) and 300s timeout
+  // Ensure built-in server Gemini provider defaults to gemini-3.5-flash-lite with strict max 10 RPM and 300s timeout
   const builtin = db
     .prepare(`SELECT id, model_name, rpm_limit, timeout_ms FROM api_providers WHERE provider_type = 'gemini_builtin'`)
     .get() as { id: number; model_name: string; rpm_limit: number; timeout_ms: number } | undefined;
@@ -231,7 +231,7 @@ function initDefaultsAndCrashRecovery(): void {
       builtin.model_name === 'gemini-4-hydrogen' || builtin.model_name === 'gemini-3.1-flash-lite'
         ? 'gemini-3.5-flash-lite'
         : builtin.model_name;
-    const nextRpm = builtin.rpm_limit === 30 ? 10 : builtin.rpm_limit;
+    const nextRpm = Math.min(10, Math.max(1, builtin.rpm_limit || 10));
     const nextTimeout = builtin.timeout_ms < 300000 ? 300000 : builtin.timeout_ms;
     db.prepare(
       `UPDATE api_providers
@@ -239,6 +239,13 @@ function initDefaultsAndCrashRecovery(): void {
        WHERE id = ?`
     ).run(nextModel, nextRpm, nextTimeout, builtin.id);
   }
+
+  // Clamp any existing Gemini provider to strict max 10 RPM so keys never get cut off
+  db.prepare(
+    `UPDATE api_providers
+     SET rpm_limit = 10
+     WHERE provider_type IN ('gemini', 'gemini_builtin') AND rpm_limit > 10`
+  ).run();
 
   // Seed default settings
   const upsertSetting = db.prepare(
@@ -251,6 +258,19 @@ function initDefaultsAndCrashRecovery(): void {
   db.prepare(
     `UPDATE app_settings SET value = '300000' WHERE key = 'adaptiveProxyTimeoutMs' AND value = '180000'`
   ).run();
+
+  // One-time upgrade of default batchSize from 18 -> 35 while respecting future manual changes
+  const migratedBatch = db
+    .prepare(`SELECT value FROM app_settings WHERE key = 'migrated_batch_size_35'`)
+    .get();
+  if (!migratedBatch) {
+    db.prepare(
+      `UPDATE app_settings SET value = '35' WHERE key = 'batchSize' AND value = '18'`
+    ).run();
+    db.prepare(
+      `INSERT OR REPLACE INTO app_settings (key, value) VALUES ('migrated_batch_size_35', '1')`
+    ).run();
+  }
 }
 
 initDefaultsAndCrashRecovery();

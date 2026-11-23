@@ -41,7 +41,6 @@ import {
   verifyTimecodeIntegrity,
 } from './subtitleEngine.ts';
 import { translationManager } from './translationManager.ts';
-import { buildPythonDesktopZipBuffer, listPythonDesktopFiles } from './pythonExport.ts';
 
 export const apiRouter = Router();
 
@@ -805,34 +804,109 @@ apiRouter.get('/files/:id/verify-integrity', (req, res) => {
   res.json(report);
 });
 
-apiRouter.get('/files/:id/export', (req, res) => {
+apiRouter.get('/files/:id/export', async (req, res) => {
   const fileId = Number(req.params.id);
   const bilingual = req.query.bilingual === '1';
+  const reqFormat = String(req.query.format || 'original').toLowerCase();
   const file = getFileById(fileId);
   if (!file) {
     res.status(404).json({ error: 'فایل یافت نشد.' });
     return;
   }
   const cues = getCuesByFileId(fileId);
+  const baseName = file.fileName.replace(/\.(srt|vtt)$/i, '');
+
+  // Export BOTH SRT and VTT together in a single ZIP regardless of input format
+  if (reqFormat === 'both') {
+    const srtOut = serializeSubtitleFile({
+      format: file.format,
+      targetFormat: 'srt',
+      fileHeader: file.fileHeader,
+      lineEnding: file.lineEnding,
+      cues,
+      fallbackToSource: true,
+      bilingual,
+    });
+    const vttOut = serializeSubtitleFile({
+      format: file.format,
+      targetFormat: 'vtt',
+      fileHeader: file.fileHeader,
+      lineEnding: file.lineEnding,
+      cues,
+      fallbackToSource: true,
+      bilingual,
+    });
+    const srtCheck = verifyTimecodeIntegrity(
+      cues,
+      srtOut,
+      `${baseName}.srt`,
+      file.format !== 'srt'
+    );
+    const vttCheck = verifyTimecodeIntegrity(
+      cues,
+      vttOut,
+      `${baseName}.vtt`,
+      file.format !== 'vtt'
+    );
+
+    const zip = new JSZip();
+    const suffix = bilingual ? '.fa.bilingual' : '.fa';
+    zip.file(`${baseName}${suffix}.srt`, srtOut);
+    zip.file(`${baseName}${suffix}.vtt`, vttOut);
+    const buffer = await zip.generateAsync({
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 },
+    });
+
+    const zipName = `${baseName}${suffix}.srt+vtt.zip`;
+    addLog({
+      level: 'success',
+      category: 'export',
+      projectId: file.projectId,
+      fileId: file.id,
+      message: `خروجی دوفرمته SRT + VTT برای «${file.fileName}» با تایید ۱۰۰٪ صحت Timecode تولید شد.`,
+    });
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader(
+      'X-Timecode-Integrity',
+      srtCheck.valid && vttCheck.valid ? 'verified-100' : 'mismatch'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(zipName)}`
+    );
+    res.send(buffer);
+    return;
+  }
+
+  const targetFormat: 'srt' | 'vtt' =
+    reqFormat === 'srt' ? 'srt' : reqFormat === 'vtt' ? 'vtt' : file.format;
   const output = serializeSubtitleFile({
     format: file.format,
+    targetFormat,
     fileHeader: file.fileHeader,
     lineEnding: file.lineEnding,
     cues,
     fallbackToSource: true,
     bilingual,
   });
-  const integrity = verifyTimecodeIntegrity(cues, output, file.fileName);
-  const ext = `.${file.format}`;
-  const baseName = file.fileName.replace(/\.(srt|vtt)$/i, '');
+  const ext = `.${targetFormat}`;
   const downloadName = `${baseName}.fa${bilingual ? '.bilingual' : ''}${ext}`;
+  const integrity = verifyTimecodeIntegrity(
+    cues,
+    output,
+    downloadName,
+    targetFormat !== file.format
+  );
 
   addLog({
     level: 'success',
     category: 'export',
     projectId: file.projectId,
     fileId: file.id,
-    message: `خروجی فایل «${downloadName}» با تایید ۱۰۰٪ صحت Timecode تولید شد (${integrity.exportedCount} خط).`,
+    message: `خروجی ${targetFormat.toUpperCase()} فایل «${downloadName}» با تایید ۱۰۰٪ صحت Timecode تولید شد (${integrity.exportedCount} خط).`,
   });
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -846,11 +920,13 @@ apiRouter.get('/files/:id/export', (req, res) => {
 
 apiRouter.post('/projects/:id/export-zip', async (req, res) => {
   const projectId = Number(req.params.id);
-  const { fileIds, folderPath, bilingual } = req.body as {
+  const { fileIds, folderPath, bilingual, exportFormat } = req.body as {
     fileIds?: number[];
     folderPath?: string;
     bilingual?: boolean;
+    exportFormat?: 'both' | 'srt' | 'vtt' | 'original';
   };
+  const resolvedExportFormat = exportFormat || 'both';
 
   let rows: Array<Record<string, unknown>>;
   if (Array.isArray(fileIds) && fileIds.length > 0) {
@@ -879,22 +955,44 @@ apiRouter.post('/projects/:id/export-zip', async (req, res) => {
 
   const zip = new JSZip();
   let verifiedCount = 0;
+  let totalExportedFiles = 0;
 
   for (const r of rows) {
     const file = mapSubtitleFile(r);
     const cues = getCuesByFileId(file.id);
-    const output = serializeSubtitleFile({
-      format: file.format,
-      fileHeader: file.fileHeader,
-      lineEnding: file.lineEnding,
-      cues,
-      fallbackToSource: true,
-      bilingual: Boolean(bilingual),
-    });
-    const check = verifyTimecodeIntegrity(cues, output, file.fileName);
-    if (check.valid) verifiedCount += 1;
-    // Preserve exact relative folder hierarchy inside ZIP
-    zip.file(file.relativePath, output);
+    const baseRelPath = file.relativePath.replace(/\.(srt|vtt)$/i, '');
+    const targetFormats: Array<'srt' | 'vtt'> =
+      resolvedExportFormat === 'both'
+        ? ['srt', 'vtt']
+        : resolvedExportFormat === 'srt'
+          ? ['srt']
+          : resolvedExportFormat === 'vtt'
+            ? ['vtt']
+            : [file.format];
+
+    let fileVerified = true;
+    for (const tf of targetFormats) {
+      const output = serializeSubtitleFile({
+        format: file.format,
+        targetFormat: tf,
+        fileHeader: file.fileHeader,
+        lineEnding: file.lineEnding,
+        cues,
+        fallbackToSource: true,
+        bilingual: Boolean(bilingual),
+      });
+      const outPath = `${baseRelPath}.${tf}`;
+      const check = verifyTimecodeIntegrity(
+        cues,
+        output,
+        outPath,
+        tf !== file.format
+      );
+      if (!check.valid) fileVerified = false;
+      zip.file(outPath, output);
+      totalExportedFiles += 1;
+    }
+    if (fileVerified) verifiedCount += 1;
   }
 
   const buffer = await zip.generateAsync({
@@ -903,17 +1001,22 @@ apiRouter.post('/projects/:id/export-zip', async (req, res) => {
     compressionOptions: { level: 6 },
   });
 
+  const formatLabel =
+    resolvedExportFormat === 'both'
+      ? 'SRT + VTT'
+      : resolvedExportFormat.toUpperCase();
+
   addLog({
     level: 'success',
     category: 'export',
     projectId,
-    message: `خروجی گروهی ZIP شامل ${rows.length} فایل با حفظ ساختار پوشه‌ها تولید شد (${verifiedCount}/${rows.length} تایید ۱۰۰٪ زمان‌بندی).`,
+    message: `خروجی گروهی ZIP (${formatLabel}) شامل ${totalExportedFiles} فایل از ${rows.length} زیرنویس با حفظ ساختار پوشه‌ها تولید شد (${verifiedCount}/${rows.length} تایید ۱۰۰٪ زمان‌بندی).`,
   });
 
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader(
     'Content-Disposition',
-    `attachment; filename="subtitles_fa_project_${projectId}.zip"`
+    `attachment; filename="subtitles_fa_${resolvedExportFormat}_project_${projectId}.zip"`
   );
   res.send(buffer);
 });
@@ -969,8 +1072,13 @@ apiRouter.post('/providers', (req, res) => {
   const isGemini = providerType === 'gemini' || providerType === 'gemini_builtin';
   const resolvedBase = (baseUrl || DEFAULT_BASE_URLS[providerType] || '').trim();
   const resolvedModel = (modelName || defaultModels[providerType] || 'gpt-4o-mini').trim();
-  const resolvedRpm = rpmLimit ?? (isGemini ? 10 : 20);
+  const resolvedRpm = isGemini
+    ? Math.min(10, Math.max(1, rpmLimit ?? 10))
+    : Math.max(1, rpmLimit ?? 20);
   const resolvedTimeoutMs = timeoutMs ?? 300000;
+  const availableModels = isGemini
+    ? Array.from(new Set([resolvedModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen']))
+    : [resolvedModel];
 
   const info = db
     .prepare(
@@ -986,7 +1094,7 @@ apiRouter.post('/providers', (req, res) => {
       resolvedBase,
       (apiKey || '').trim(),
       resolvedModel,
-      JSON.stringify([resolvedModel]),
+      JSON.stringify(availableModels),
       priority ?? 10,
       resolvedRpm,
       tpmLimit ?? 120000,
@@ -1032,12 +1140,35 @@ apiRouter.post('/providers/bulk-import', (req, res) => {
   };
 
   const rawLines = (keysText || '')
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 4);
+    .split(/[\r\n,;]+/)
+    .map((l) => l.trim().replace(/^["']|["']$/g, ''))
+    .filter((l) => l.length >= 8 && !l.startsWith('#'));
 
   if (rawLines.length === 0) {
     res.status(400).json({ error: 'حداقل یک کلید معتبر (هر کلید در یک خط) وارد کنید.' });
+    return;
+  }
+
+  // Deduplicate pasted keys and skip keys already registered in SQLite
+  const existingKeysRows = db
+    .prepare(`SELECT api_key FROM api_providers WHERE api_key != ''`)
+    .all() as Array<{ api_key: string }>;
+  const existingKeySet = new Set(existingKeysRows.map((r) => r.api_key.trim()));
+  const uniqueKeys: string[] = [];
+  let skippedDuplicates = 0;
+  for (const k of rawLines) {
+    if (existingKeySet.has(k)) {
+      skippedDuplicates += 1;
+      continue;
+    }
+    existingKeySet.add(k);
+    uniqueKeys.push(k);
+  }
+
+  if (uniqueKeys.length === 0) {
+    res.status(400).json({
+      error: 'همه کلیدهای واردشده قبلاً در لیست APIها ثبت شده‌اند.',
+    });
     return;
   }
 
@@ -1051,7 +1182,19 @@ apiRouter.post('/providers/bulk-import', (req, res) => {
         ? 'deepseek-chat'
         : 'gpt-4o-mini')
   ).trim();
-  const prefix = (namePrefix || providerType.toUpperCase()).trim();
+  const resolvedRpm = isGemini
+    ? Math.min(10, Math.max(1, rpmLimit ?? 10))
+    : Math.max(1, rpmLimit ?? 20);
+  const availableModels = isGemini
+    ? Array.from(new Set([resolvedModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen']))
+    : [resolvedModel];
+  const prefix = (namePrefix || (isGemini ? 'GEMINI' : providerType.toUpperCase())).trim();
+
+  // Continue sequential numbering so new keys don't collide with existing names
+  const existingCountRow = db
+    .prepare(`SELECT COUNT(*) as c FROM api_providers WHERE provider_type = ?`)
+    .get(providerType) as { c: number };
+  const startNumber = Number(existingCountRow?.c || 0) + 1;
 
   const insertStmt = db.prepare(
     `INSERT INTO api_providers (
@@ -1063,16 +1206,16 @@ apiRouter.post('/providers/bulk-import', (req, res) => {
   const added: ReturnType<typeof mapProviderPublic>[] = [];
   db.exec('BEGIN');
   try {
-    rawLines.forEach((key, idx) => {
+    uniqueKeys.forEach((key, idx) => {
       const info = insertStmt.run(
-        `${prefix} #${idx + 1}`,
+        `${prefix} #${startNumber + idx}`,
         providerType,
         resolvedBase,
         key,
         resolvedModel,
-        JSON.stringify([resolvedModel]),
-        (priorityStart ?? 10) + idx,
-        rpmLimit ?? (isGemini ? 10 : 20),
+        JSON.stringify(availableModels),
+        priorityStart ?? 5,
+        resolvedRpm,
         tpmLimit ?? 120000,
         timeoutMs ?? 300000
       );
@@ -1091,10 +1234,11 @@ apiRouter.post('/providers/bulk-import', (req, res) => {
   addLog({
     level: 'success',
     category: 'api',
-    message: `${added.length} کلید API به صورت گروهی برای «${prefix}» با کنترل ایمن RPM اضافه شد.`,
+    modelName: resolvedModel,
+    message: `${added.length} کلید API به صورت گروهی برای «${prefix}» با مدل ${resolvedModel} و سقف ${resolvedRpm} RPM اضافه شد${skippedDuplicates > 0 ? ` (${skippedDuplicates} کلید تکراری رد شد)` : ''}.`,
   });
 
-  res.status(201).json({ added, count: added.length });
+  res.status(201).json({ added, count: added.length, skippedDuplicates });
 });
 
 apiRouter.post('/providers/bulk-import-mixed', (req, res) => {
@@ -1142,6 +1286,12 @@ apiRouter.post('/providers/bulk-import-mixed', (req, res) => {
       const base = (item.baseUrl || DEFAULT_BASE_URLS[pType] || '').trim();
       if (!key && pType !== 'custom_proxy') return;
       const model = (item.modelName || defaultModels[pType] || 'gpt-4o-mini').trim();
+      const resolvedRpm = isGemini
+        ? Math.min(10, Math.max(1, item.rpmLimit ?? 10))
+        : Math.max(1, item.rpmLimit ?? 20);
+      const availableModels = isGemini
+        ? Array.from(new Set([model, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen']))
+        : [model];
       const displayName = (item.name || `${pType.toUpperCase()} #${idx + 1}`).trim();
       const info = insertStmt.run(
         displayName,
@@ -1149,9 +1299,9 @@ apiRouter.post('/providers/bulk-import-mixed', (req, res) => {
         base,
         key,
         model,
-        JSON.stringify([model]),
+        JSON.stringify(availableModels),
         item.priority ?? 10 + idx,
-        item.rpmLimit ?? (isGemini ? 10 : 20),
+        resolvedRpm,
         item.tpmLimit ?? 120000,
         item.timeoutMs ?? 300000
       );
@@ -1206,6 +1356,16 @@ apiRouter.patch('/providers/:id', (req, res) => {
     clearCooldown: boolean;
   }>;
 
+  const isGemini =
+    existing.provider_type === 'gemini' ||
+    existing.provider_type === 'gemini_builtin';
+  const nextRpm =
+    body.rpmLimit !== undefined
+      ? isGemini
+        ? Math.min(10, Math.max(1, body.rpmLimit))
+        : Math.max(1, body.rpmLimit)
+      : existing.rpm_limit;
+
   db.prepare(
     `UPDATE api_providers
      SET name = ?, base_url = ?, api_key = ?, model_name = ?,
@@ -1221,7 +1381,7 @@ apiRouter.patch('/providers/:id', (req, res) => {
       : existing.api_key,
     body.modelName?.trim() || existing.model_name,
     body.priority ?? existing.priority,
-    body.rpmLimit ?? existing.rpm_limit,
+    nextRpm,
     body.tpmLimit ?? existing.tpm_limit,
     body.timeoutMs ?? existing.timeout_ms,
     body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
@@ -1274,7 +1434,7 @@ apiRouter.post('/providers/:id/test', async (req, res) => {
     providerName: row.name,
     modelName: result.modelUsed,
     message: result.ok
-      ? `تست اتصال «${row.name}» موفق بود (${result.latencyMs}ms، پاسخ نمونه: ${result.sampleReply})`
+      ? `تست اتصال «${row.name}» موفق بود (${result.latencyMs}ms${result.fallbackFromModel ? ` · سوئیچ خودکار از ${result.fallbackFromModel} به ${result.modelUsed}` : ''}، پاسخ نمونه: ${result.sampleReply})`
       : `تست اتصال «${row.name}» ناموفق بود: ${result.error}`,
     tokensUsed: result.tokensUsed,
     latencyMs: result.latencyMs,
@@ -1444,27 +1604,6 @@ apiRouter.post('/backup/restore', (req, res) => {
   } catch (err) {
     res.status(400).json({
       error: err instanceof Error ? err.message : 'خطا در بازیابی فایل پشتیبان.',
-    });
-  }
-});
-
-// ---------- Python Desktop Package & EXE Builder ----------
-apiRouter.get('/desktop/files', (_req, res) => {
-  res.json({ files: listPythonDesktopFiles() });
-});
-
-apiRouter.get('/desktop/download-zip', async (_req, res) => {
-  try {
-    const buffer = await buildPythonDesktopZipBuffer();
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader(
-      'Content-Disposition',
-      'attachment; filename="AI-Subtitle-Translator-Python-Desktop.zip"'
-    );
-    res.send(buffer);
-  } catch (err) {
-    res.status(500).json({
-      error: `خطا در بسته‌بندی نسخه دسکتاپ پایتون: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
 });

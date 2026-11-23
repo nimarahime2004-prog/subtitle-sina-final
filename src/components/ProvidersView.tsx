@@ -90,12 +90,17 @@ export function ProvidersView({
   onNotify,
 }: ProvidersViewProps) {
   const [mode, setMode] = useState<'none' | 'single' | 'bulk'>('none');
-  const [bulkTab, setBulkTab] = useState<'mixed' | 'same_provider' | 'paste_lines'>('mixed');
+  const [bulkTab, setBulkTab] = useState<'gemini_quick' | 'mixed' | 'same_provider' | 'paste_lines'>('gemini_quick');
   const [testingId, setTestingId] = useState<number | null>(null);
   const [fetchingModelsId, setFetchingModelsId] = useState<number | null>(null);
   const [testReplies, setTestReplies] = useState<
-    Record<number, { ok: boolean; latencyMs: number; tokensUsed: number; reply?: string; error?: string }>
+    Record<number, { ok: boolean; latencyMs: number; tokensUsed: number; modelUsed?: string; fallbackFromModel?: string; reply?: string; error?: string }>
   >({});
+
+  // Dedicated Gemini-only quick bulk paste state
+  const [geminiQuickKeys, setGeminiQuickKeys] = useState('');
+  const [geminiQuickPrefix, setGeminiQuickPrefix] = useState('GEMINI');
+  const [geminiQuickRpm, setGeminiQuickRpm] = useState(10);
 
   // Single add form state
   const [providerType, setProviderType] = useState<ProviderType>('gemini');
@@ -110,12 +115,21 @@ export function ProvidersView({
 
   // Same-provider multi-key bulk form state
   const [bulkType, setBulkType] = useState<ProviderType>('gemini');
-  const [bulkPrefix, setBulkPrefix] = useState('Gemini Pool');
+  const [bulkPrefix, setBulkPrefix] = useState('GEMINI');
   const [bulkBaseUrl, setBulkBaseUrl] = useState('');
   const [bulkModel, setBulkModel] = useState('gemini-3.5-flash-lite');
   const [bulkRpm, setBulkRpm] = useState(10);
   const [bulkTimeoutSec, setBulkTimeoutSec] = useState(300);
   const [bulkKeys, setBulkKeys] = useState('');
+
+  const detectedGeminiKeysCount = Array.from(
+    new Set(
+      geminiQuickKeys
+        .split(/[\r\n,;]+/)
+        .map((l) => l.trim().replace(/^["']|["']$/g, ''))
+        .filter((l) => l.length >= 8 && !l.startsWith('#'))
+    )
+  ).length;
 
   // Mixed multi-provider table state
   const [mixedRows, setMixedRows] = useState<MixedBulkRow[]>([
@@ -165,6 +179,34 @@ export function ProvidersView({
     }
   };
 
+  const handleGeminiQuickBulk = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!geminiQuickKeys.trim()) return;
+    try {
+      const safeRpm = Math.min(10, Math.max(1, geminiQuickRpm || 10));
+      const res = await api.bulkImportProviders({
+        providerType: 'gemini',
+        namePrefix: geminiQuickPrefix.trim() || 'GEMINI',
+        baseUrl: '',
+        modelName: 'gemini-3.5-flash-lite',
+        keysText: geminiQuickKeys,
+        priorityStart: 5,
+        rpmLimit: safeRpm,
+        tpmLimit: 200000,
+        timeoutMs: 300000,
+      });
+      setGeminiQuickKeys('');
+      setMode('none');
+      await onRefresh();
+      onNotify(
+        `${res.count} کلید Gemini روی مدل gemini-3.5-flash-lite (سقف ${safeRpm} RPM + سوئیچ خودکار به 3.1-flash-lite) ثبت شد${res.skippedDuplicates ? ` (${res.skippedDuplicates} تکراری رد شد)` : ''}.`,
+        'success'
+      );
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'خطا در ثبت گروهی کلیدهای Gemini', 'error');
+    }
+  };
+
   const handleBulkSameProvider = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!bulkKeys.trim()) return;
@@ -176,7 +218,7 @@ export function ProvidersView({
         modelName: bulkModel.trim(),
         keysText: bulkKeys,
         priorityStart: 10,
-        rpmLimit: bulkRpm,
+        rpmLimit: bulkType === 'gemini' ? Math.min(10, bulkRpm) : bulkRpm,
         tpmLimit: 120000,
         timeoutMs: bulkTimeoutSec * 1000,
       });
@@ -321,6 +363,8 @@ export function ProvidersView({
           ok: res.result.ok,
           latencyMs: res.result.latencyMs,
           tokensUsed: res.result.tokensUsed,
+          modelUsed: res.result.modelUsed,
+          fallbackFromModel: res.result.fallbackFromModel,
           reply: res.result.sampleReply,
           error: res.result.error,
         },
@@ -328,7 +372,7 @@ export function ProvidersView({
       await onRefresh();
       onNotify(
         res.result.ok
-          ? `تست موفق (${res.result.latencyMs}ms · ${res.result.tokensUsed} توکن)`
+          ? `تست موفق با ${res.result.modelUsed} (${res.result.latencyMs}ms · ${res.result.tokensUsed} توکن)${res.result.fallbackFromModel ? ` — سوئیچ خودکار از ${res.result.fallbackFromModel}` : ''}`
           : `تست ناموفق: ${res.result.error}`,
         res.result.ok ? 'success' : 'error'
       );
@@ -377,21 +421,34 @@ export function ProvidersView({
       <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h2 className="text-base font-semibold text-slate-900 dark:text-slate-50">
-            مدیریت چند API، حفاظت ضدبلاک RPM جمنای و تحمل تأخیر واسط‌ها
+            مدیریت APIها، سقف سخت‌گیرانه ۱۰ RPM جمنای و سوئیچ خودکار مدل
           </h2>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            مدل پیش‌فرض روی <span className="font-mono text-slate-700 dark:text-slate-200">gemini-3.5-flash-lite</span> با سقف ایمن ۱۰ درخواست در دقیقه، قفل همزمانی روی هر کلید و سقف انتظار صبورانه ۳۰۰ تا ۹۰۰ ثانیه (با استریم Keep-Alive برای پروکسی‌های کند) تنظیم شده است.
+            مدل پیش‌فرض <span className="font-mono text-slate-700 dark:text-slate-200">gemini-3.5-flash-lite</span> است و در صورت خطای 503 / شلوغی سرور به‌صورت خودکار روی <span className="font-mono text-slate-700 dark:text-slate-200">gemini-3.1-flash-lite</span> سوئیچ می‌شود. هر کلید Gemini حداکثر ۱۰ درخواست در دقیقه ارسال می‌کند تا قطع یا بلاک نشود.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           <button
             type="button"
-            onClick={() => setMode(mode === 'bulk' ? 'none' : 'bulk')}
+            onClick={() => {
+              setBulkTab('gemini_quick');
+              setMode(mode === 'bulk' && bulkTab === 'gemini_quick' ? 'none' : 'bulk');
+            }}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white cursor-pointer whitespace-nowrap"
           >
             <Layers className="w-3.5 h-3.5" />
-            افزودن یکجای گروهی APIها
+            افزودن گروهی کلیدهای Gemini
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setBulkTab('mixed');
+              setMode(mode === 'bulk' && bulkTab === 'mixed' ? 'none' : 'bulk');
+            }}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+          >
+            چند API مختلف
           </button>
           <button
             type="button"
@@ -399,7 +456,7 @@ export function ProvidersView({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer whitespace-nowrap"
           >
             <Plus className="w-3.5 h-3.5" />
-            افزودن تکی API
+            افزودن تکی
           </button>
         </div>
       </div>
@@ -539,19 +596,30 @@ export function ProvidersView({
         </form>
       )}
 
-      {/* Upgraded Bulk Import Panel: Mixed Multi-API Table + Same Provider Multi-Key + Paste Lines/JSON */}
+      {/* Upgraded Bulk Import Panel: Dedicated Gemini Quick Paste + Mixed Multi-API Table + Same Provider + Paste Lines/JSON */}
       {mode === 'bulk' && (
         <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4 text-xs">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                افزودن یکجای گروهی از APIها (تک‌سرویسی یا ترکیبی چندسرویسی)
+                ورود گروهی و یکجای کلیدها و سرویس‌های API
               </h3>
               <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                می‌توانید چند سرویس متفاوت (مثلاً جمنای + دیپ‌سیک + پروکسی واسط) یا ده‌ها کلید جمنای را یکجا اضافه کنید.
+                لیست کلیدهای Gemini را مستقیم خط‌به‌خط Paste کنید (مثل <code className="font-mono" dir="ltr">AQ....</code> یا <code className="font-mono" dir="ltr">AIza...</code>)؛ همه خودکار روی <code className="font-mono" dir="ltr">gemini-3.5-flash-lite</code> و سقف ≤۱۰ RPM ثبت می‌شوند.
               </p>
             </div>
-            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg shrink-0">
+            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg shrink-0 overflow-x-auto">
+              <button
+                type="button"
+                onClick={() => setBulkTab('gemini_quick')}
+                className={`px-3 py-1.5 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  bulkTab === 'gemini_quick'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-50 shadow-sm'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                فقط کلیدهای Gemini (سریع)
+              </button>
               <button
                 type="button"
                 onClick={() => setBulkTab('mixed')}
@@ -572,7 +640,7 @@ export function ProvidersView({
                     : 'text-slate-600 dark:text-slate-400'
                 }`}
               >
-                چند کلید از یک سرویس
+                سایر سرویس‌ها (چند کلید)
               </button>
               <button
                 type="button"
@@ -587,6 +655,85 @@ export function ProvidersView({
               </button>
             </div>
           </div>
+
+          {bulkTab === 'gemini_quick' && (
+            <form onSubmit={handleGeminiQuickBulk} className="space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                <div>
+                  <label className="block mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                    پیشوند نام کلیدها
+                  </label>
+                  <input
+                    type="text"
+                    value={geminiQuickPrefix}
+                    onChange={(e) => setGeminiQuickPrefix(e.target.value)}
+                    placeholder="GEMINI"
+                    className="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700"
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                    مدل اصلی و جایگزین خودکار
+                  </label>
+                  <div className="px-3 py-2 rounded-lg font-mono bg-slate-100 dark:bg-slate-800/70 text-slate-700 dark:text-slate-200 truncate" dir="ltr">
+                    gemini-3.5-flash-lite → 3.1
+                  </div>
+                </div>
+                <div>
+                  <label className="block mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                    سقف درخواست در دقیقه هر کلید (حداکثر ۱۰)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={geminiQuickRpm}
+                    onChange={(e) =>
+                      setGeminiQuickRpm(Math.min(10, Math.max(1, Number(e.target.value) || 10)))
+                    }
+                    className="w-full px-3 py-2 rounded-lg font-mono bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <div className="w-full px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800/70 text-slate-700 dark:text-slate-300 font-mono tabular-nums">
+                    {detectedGeminiKeysCount} کلید یکتا شناسایی شد
+                  </div>
+                </div>
+              </div>
+
+              <textarea
+                rows={7}
+                dir="ltr"
+                required
+                value={geminiQuickKeys}
+                onChange={(e) => setGeminiQuickKeys(e.target.value)}
+                placeholder={'AQ.Ab8RN6...\nAQ.Ab8RN6...\nAIzaSy...\n(هر کلید Gemini در یک خط)'}
+                className="w-full px-3 py-2.5 rounded-lg font-mono leading-5 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700"
+              />
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                  کلیدهای تکراری به‌صورت خودکار حذف می‌شوند و بین همه کلیدها توزیع موازی (Round-Robin) انجام می‌گیرد.
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMode('none')}
+                    className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-700 cursor-pointer"
+                  >
+                    انصراف
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={detectedGeminiKeysCount === 0}
+                    className="px-4 py-2 font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-45 text-white cursor-pointer"
+                  >
+                    افزودن {detectedGeminiKeysCount > 0 ? `${detectedGeminiKeysCount} کلید` : 'همه کلیدهای'} Gemini
+                  </button>
+                </div>
+              </div>
+            </form>
+          )}
 
           {bulkTab === 'mixed' && (
             <form onSubmit={handleSubmitMixedRows} className="space-y-3">
@@ -958,12 +1105,14 @@ export function ProvidersView({
                     <input
                       type="number"
                       min={1}
-                      max={500}
+                      max={isGemini ? 10 : 500}
                       defaultValue={p.rpmLimit}
                       onBlur={(e) => {
-                        const v = Math.max(1, Number(e.target.value) || p.rpmLimit);
+                        const raw = Math.max(1, Number(e.target.value) || p.rpmLimit);
+                        const v = isGemini ? Math.min(10, raw) : raw;
                         if (v !== p.rpmLimit) void handleQuickPatch(p.id, { rpmLimit: v });
                       }}
+                      title={isGemini ? 'سقف سخت‌گیرانه حداکثر ۱۰ درخواست در دقیقه برای هر کلید Gemini' : 'سقف درخواست در دقیقه'}
                       className="w-14 px-2 py-1 text-xs font-mono rounded bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100"
                     />
                   </label>
@@ -1074,7 +1223,8 @@ export function ProvidersView({
                 <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 text-xs">
                   {lastTest?.ok ? (
                     <div className="text-emerald-600 dark:text-emerald-400">
-                      پاسخ زنده ({lastTest.latencyMs}ms · {lastTest.tokensUsed} توکن): «{lastTest.reply}»
+                      پاسخ زنده با {lastTest.modelUsed || p.modelName} ({lastTest.latencyMs}ms · {lastTest.tokensUsed} توکن)
+                      {lastTest.fallbackFromModel ? ` [سوئیچ خودکار از ${lastTest.fallbackFromModel}]` : ''}: «{lastTest.reply}»
                     </div>
                   ) : (
                     <div className="text-red-600 dark:text-red-400">

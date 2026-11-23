@@ -82,6 +82,7 @@ export function ProjectsView({
   const [newCustomPrompt, setNewCustomPrompt] = useState('');
   const [selectedFolder, setSelectedFolder] = useState<string>('__ALL__');
   const [bilingualExport, setBilingualExport] = useState(false);
+  const [zipExportFormat, setZipExportFormat] = useState<'both' | 'srt' | 'vtt' | 'original'>('both');
   const [selectedFileIds, setSelectedFileIds] = useState<Set<number>>(new Set());
   const [confirmDeleteFolder, setConfirmDeleteFolder] = useState<string | null>(null);
   const [confirmDeleteFileId, setConfirmDeleteFileId] = useState<number | null>(null);
@@ -152,9 +153,14 @@ export function ProjectsView({
             ? folderPath
             : undefined,
         bilingual: bilingualExport,
+        exportFormat: zipExportFormat,
       });
+      const label =
+        zipExportFormat === 'both'
+          ? 'SRT + VTT'
+          : zipExportFormat.toUpperCase();
       onNotify(
-        'خروجی گروهی ZIP با حفظ ساختار پوشه‌ها و تایید ۱۰۰٪ زمان‌بندی آماده شد.',
+        `خروجی گروهی ZIP (${label}) با حفظ ساختار پوشه‌ها و تایید ۱۰۰٪ زمان‌بندی آماده شد.`,
         'success'
       );
     } catch (err) {
@@ -669,6 +675,22 @@ export function ProjectsView({
                 <Play className="w-3.5 h-3.5" />
                 ترجمه این پوشه ({visibleFiles.length})
               </button>
+              <select
+                value={zipExportFormat}
+                onChange={(e) =>
+                  setZipExportFormat(
+                    e.target.value as 'both' | 'srt' | 'vtt' | 'original'
+                  )
+                }
+                className="px-2.5 py-2 text-xs rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-slate-800 dark:text-slate-200"
+                title="فرمت خروجی گروهی ZIP"
+              >
+                <option value="both">خروجی: هر دو (SRT + VTT)</option>
+                <option value="srt">خروجی: فقط SRT</option>
+                <option value="vtt">خروجی: فقط VTT</option>
+                <option value="original">خروجی: فرمت اصلی</option>
+              </select>
+
               <button
                 type="button"
                 disabled={visibleFiles.length === 0}
@@ -676,7 +698,7 @@ export function ProjectsView({
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-45 cursor-pointer whitespace-nowrap"
               >
                 <Download className="w-3.5 h-3.5" />
-                خروجی ZIP
+                دانلود ZIP
               </button>
             </div>
           </div>
@@ -755,14 +777,32 @@ export function ProjectsView({
                         <CheckCircle2 className="w-4 h-4" />
                       </button>
 
-                      <a
-                        href={api.exportSingleFileUrl(file.id, bilingualExport)}
-                        download
-                        className="p-1.5 rounded-md text-slate-500 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100 dark:hover:bg-slate-800"
-                        title="دانلود فایل ترجمه‌شده"
-                      >
-                        <Download className="w-4 h-4" />
-                      </a>
+                      <div className="inline-flex items-center rounded-md border border-slate-200 dark:border-slate-700 overflow-hidden text-[11px] font-mono">
+                        <a
+                          href={api.exportSingleFileUrl(file.id, 'srt', bilingualExport)}
+                          download
+                          className="px-2 py-1 text-slate-700 dark:text-slate-200 hover:bg-blue-600 hover:text-white transition-colors"
+                          title="دانلود فایل با فرمت SRT"
+                        >
+                          SRT
+                        </a>
+                        <a
+                          href={api.exportSingleFileUrl(file.id, 'vtt', bilingualExport)}
+                          download
+                          className="px-2 py-1 border-r border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-blue-600 hover:text-white transition-colors"
+                          title="دانلود فایل با فرمت VTT"
+                        >
+                          VTT
+                        </a>
+                        <a
+                          href={api.exportSingleFileUrl(file.id, 'both', bilingualExport)}
+                          download
+                          className="px-2 py-1 border-r border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-blue-600 hover:text-white transition-colors font-sans"
+                          title="دانلود همزمان SRT و VTT در یک فایل ZIP"
+                        >
+                          هر دو
+                        </a>
+                      </div>
 
                       {confirmDeleteFileId === file.id ? (
                         <div className="inline-flex items-center gap-1.5 text-[11px]">
