@@ -508,6 +508,8 @@ export default function App() {
               logs={logs}
               providers={providers}
               onRefresh={loadLogs}
+              onRefreshProviders={() => loadCoreData(activeProject?.id)}
+              onOpenProviders={() => setNav('providers')}
               onNotify={notify}
             />
           )}

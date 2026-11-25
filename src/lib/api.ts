@@ -330,6 +330,14 @@ export const api = {
       `/api/providers/${id}/models`,
       { method: 'POST' }
     ),
+  cleanupProviderErrors: (body: {
+    action: 'disable_errors' | 'delete_errors' | 'clear_cooldowns';
+    providerIds?: number[];
+  }) =>
+    requestJson<{ ok: boolean; affected: number }>('/api/providers/cleanup-errors', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   // Glossary
   getGlossary: (projectId: number | 'all') =>

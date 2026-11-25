@@ -290,10 +290,28 @@ class TranslationQueueManager {
     return this.getState();
   }
 
+  private countUsableEnabledProviders(): number {
+    const rows = db
+      .prepare(
+        `SELECT id, provider_type, api_key FROM api_providers
+         WHERE enabled = 1 AND status != 'error'`
+      )
+      .all() as Array<{ id: number; provider_type: string; api_key: string }>;
+    return rows.filter((p) => {
+      if (p.provider_type === 'gemini_builtin') {
+        return Boolean(process.env.GEMINI_API_KEY);
+      }
+      return Boolean(p.api_key) || p.provider_type === 'custom_proxy';
+    }).length;
+  }
+
   private pump(): void {
     if (this.state !== 'running') return;
     const settings = getSettings();
-    const concurrency = Math.max(1, Math.min(8, settings.maxConcurrentFiles || 2));
+    const usableCount = this.countUsableEnabledProviders();
+    // Never run more concurrent files than actual usable non-error API keys (prevents collisions on 1 key)
+    const configuredConcurrency = Math.max(1, Math.min(8, settings.maxConcurrentFiles || 2));
+    const concurrency = Math.max(1, Math.min(configuredConcurrency, Math.max(1, usableCount)));
 
     while (
       this.state === 'running' &&
@@ -321,10 +339,13 @@ class TranslationQueueManager {
        WHERE status = 'cooldown' AND cooldown_until IS NOT NULL AND cooldown_until <= ?`
     ).run(nowIso);
 
+    // CRITICAL: Exclude status = 'error' (permanent 403 suspended / 401 invalid keys)
+    // so broken keys never block the pool or burn retry attempts!
     const rows = db
       .prepare(
         `SELECT * FROM api_providers
          WHERE enabled = 1
+           AND status != 'error'
            AND (cooldown_until IS NULL OR cooldown_until <= ?)
          ORDER BY priority ASC, id ASC`
       )
@@ -347,7 +368,7 @@ class TranslationQueueManager {
       return usable;
     }
 
-    // Prefer non-busy providers first so parallel files spread across distinct API keys!
+    // Prefer proven healthy keys and idle keys first so requests succeed on the first try
     const idleProviders = usable.filter((p) => !this.rateLimiter.isBusy(p.id));
     const busyProviders = usable.filter((p) => this.rateLimiter.isBusy(p.id));
     const ordered = [...idleProviders, ...busyProviders];
@@ -433,6 +454,7 @@ class TranslationQueueManager {
       phaseLabel?: string
     ): Promise<boolean> => {
       let anySucceeded = false;
+      let consecutiveBatchFailures = 0;
       let phaseProcessed = 0;
       const latestAll = getCuesByFileId(file.id);
 
@@ -496,14 +518,20 @@ class TranslationQueueManager {
           phaseLabel,
         });
 
-        if (success) anySucceeded = true;
+        if (success) {
+          anySucceeded = true;
+          consecutiveBatchFailures = 0;
+        } else {
+          consecutiveBatchFailures += 1;
+          if (this.isStopping() || this.countUsableEnabledProviders() === 0 || consecutiveBatchFailures >= 2) {
+            // Stop rushing through remaining batches when no healthy API is currently reachable
+            // Leave remaining cues untouched as 'pending' so user can resume cleanly!
+            break;
+          }
+        }
         phaseProcessed += batch.length;
         processedForFile += batch.length;
         this.totalProcessedInSession += batch.length;
-
-        if (!success && this.isStopping()) {
-          break;
-        }
       }
 
       return anySucceeded;
@@ -637,7 +665,18 @@ class TranslationQueueManager {
       params.batch.reduce((s, c) => s + c.sourceText.length, 0) / 2.2 + 500
     );
 
-    for (let attempt = 0; attempt < params.maxRetries + 4; attempt++) {
+    const totalUsable = Math.max(1, this.countUsableEnabledProviders());
+    // Ensure we can traverse ALL enabled providers AND patiently wait through up to 3 cooldown cycles
+    const maxAttempts = Math.max(params.maxRetries + 6, totalUsable * 2 + 6);
+    let cooldownWaitCycles = 0;
+    const MAX_COOLDOWN_WAIT_CYCLES = 3;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (this.isStopping()) return false;
+
+      while (this.isPaused()) {
+        await sleep(450);
+      }
       if (this.isStopping()) return false;
 
       let candidates = this.getHealthyProviders(
@@ -645,37 +684,54 @@ class TranslationQueueManager {
         triedInThisBatch
       );
 
-      // If every provider is currently in cooldown, check soonest cooldown and wait safely instead of failing immediately
+      // If we exhausted untried providers in this round, check if any non-excluded healthy providers exist
+      // OR wait patiently for the soonest provider in temporary cooldown (429 / 503) to recover!
       if (candidates.length === 0) {
         triedInThisBatch.clear();
+        candidates = this.getHealthyProviders(params.preferredProviderId);
+      }
+
+      if (candidates.length === 0) {
         const soonest = db
           .prepare(
-            `SELECT cooldown_until FROM api_providers
+            `SELECT name, cooldown_until FROM api_providers
              WHERE enabled = 1 AND status = 'cooldown' AND cooldown_until IS NOT NULL
              ORDER BY cooldown_until ASC LIMIT 1`
           )
-          .get() as { cooldown_until: string } | undefined;
+          .get() as { name: string; cooldown_until: string } | undefined;
 
-        if (soonest?.cooldown_until) {
-          const waitMs = Math.min(
-            Math.max(2000, Date.parse(soonest.cooldown_until) - Date.now() + 1000),
-            65_000
+        if (soonest?.cooldown_until && cooldownWaitCycles < MAX_COOLDOWN_WAIT_CYCLES) {
+          cooldownWaitCycles += 1;
+          const totalWaitMs = Math.min(
+            Math.max(3000, Date.parse(soonest.cooldown_until) - Date.now() + 1500),
+            95_000
           );
-          this.setWorkerNote(
-            params.file.id,
-            `همه APIها در استراحت Rate Limit هستند؛ ادامه خودکار تا ${Math.ceil(waitMs / 1000)} ثانیه دیگر...`
-          );
-          const steps = Math.ceil(waitMs / 1000);
-          for (let s = 0; s < steps && !this.isStopping(); s++) {
+          const endWaitAt = Date.now() + totalWaitMs;
+          addLog({
+            level: 'info',
+            category: 'queue',
+            projectId: params.file.projectId,
+            fileId: params.file.id,
+            message: `همه کلیدهای سالم موقتاً در استراحت Rate Limit هستند — انتظار صبورانه ${Math.ceil(totalWaitMs / 1000)} ثانیه‌ای تا آماده شدن «${soonest.name}» (دور ${cooldownWaitCycles}/${MAX_COOLDOWN_WAIT_CYCLES})...`,
+          });
+
+          while (Date.now() < endWaitAt && !this.isStopping()) {
+            const remSec = Math.max(1, Math.ceil((endWaitAt - Date.now()) / 1000));
+            this.setWorkerNote(
+              params.file.id,
+              `انتظار صبورانه تا پایان استراحت «${soonest.name}» (${remSec} ثانیه باقیمانده)...`
+            );
             await sleep(1000);
           }
+
+          if (this.isStopping()) return false;
           candidates = this.getHealthyProviders(params.preferredProviderId);
         }
       }
 
       if (candidates.length === 0) {
         const msg =
-          'هیچ API فعال یا آماده به کاری در صف موجود نیست. لطفاً در بخش مدیریت APIها کلید معتبر فعال کنید.';
+          'هیچ کلید API سالم و فعالی باقی نمانده است (کلیدهای 403 مسدود به‌صورت خودکار قرنطینه شدند). لطفاً در بخش گزارش‌ها ابزار عیب‌یابی را بررسی و کلید سالم جایگزین کنید.';
         this.markBatchError(params.file.id, params.batch, msg);
         addLog({
           level: 'error',
@@ -698,7 +754,7 @@ class TranslationQueueManager {
         batchProgress: `${Math.min(params.processedBefore + params.batch.length, params.totalTargets)} / ${params.totalTargets}`,
         waitingNote: params.phaseLabel
           ? `${params.phaseLabel} — تنظیم نرخ RPM...`
-          : 'تنظیم نرخ RPM پیش از ارسال...',
+          : 'تنظیم نرخ ایمن RPM پیش از ارسال...',
       });
       db.prepare(
         `UPDATE subtitle_files
@@ -718,7 +774,7 @@ class TranslationQueueManager {
       const worker = this.activeWorkers.get(params.file.id);
       if (worker) {
         worker.requestStartedAtMs = Date.now();
-        worker.waitingNote = 'در حال ارسال و دریافت پاسخ...';
+        worker.waitingNote = `درخواست به «${provider.name}» ارسال شد — منتظر دریافت کامل پاسخ...`;
         this.activeWorkers.set(params.file.id, worker);
       }
 
@@ -869,14 +925,17 @@ class TranslationQueueManager {
             fileId: params.file.id,
             providerName: provider.name,
             modelName: provider.model_name,
-            message: `محدودیت RPM/سهمیه در «${provider.name}» — استراحت ایمن ${cooldownSec} ثانیه‌ای و سوئیچ خودکار به API بعدی.`,
+            message: `محدودیت نرخ یا سهمیه (429) در «${provider.name}» — استراحت ایمن ${cooldownSec} ثانیه‌ای و سوئیچ خودکار به API بعدی.`,
           });
         } else if (apiErr.isAuthError) {
+          // Quarantine permanent 401/403 (e.g., CONSUMER_SUSPENDED / API_KEY_INVALID) out of active rotation
+          // Keep builtin enabled=1 only in case env key changes, but status='error' excludes it from getHealthyProviders
+          const disableOnAuthErr = provider.provider_type !== 'gemini_builtin' ? 0 : 1;
           db.prepare(
             `UPDATE api_providers
-             SET status = 'error', last_error = ?
+             SET status = 'error', enabled = ?, cooldown_until = NULL, last_error = ?
              WHERE id = ?`
-          ).run(apiErr.message, provider.id);
+          ).run(disableOnAuthErr, apiErr.message, provider.id);
 
           addLog({
             level: 'error',
@@ -885,10 +944,13 @@ class TranslationQueueManager {
             fileId: params.file.id,
             providerName: provider.name,
             modelName: provider.model_name,
-            message: `خطای احراز هویت در «${provider.name}» — سوئیچ خودکار به API بعدی: ${apiErr.message}`,
+            message: `کلید «${provider.name}» به دلیل خطای دائمی احراز هویت/تعلیق (${apiErr.statusCode}) از چرخه حذف شد — سوئیچ خودکار به API بعدی: ${apiErr.message}`,
           });
+
+          // Don't burn retry attempts on permanently dead keys!
+          attempt -= 1;
         } else {
-          const cooldownUntil = new Date(Date.now() + 20_000).toISOString();
+          const cooldownUntil = new Date(Date.now() + 25_000).toISOString();
           db.prepare(
             `UPDATE api_providers
              SET status = 'cooldown', cooldown_until = ?, last_error = ?
@@ -902,14 +964,14 @@ class TranslationQueueManager {
             fileId: params.file.id,
             providerName: provider.name,
             modelName: provider.model_name,
-            message: `تأخیر یا خطا در «${provider.name}» — سوئیچ خودکار به API بعدی: ${apiErr.message}`,
+            message: `تأخیر یا خطا (${apiErr.statusCode}) در «${provider.name}» — سوئیچ خودکار به API بعدی: ${apiErr.message}`,
           });
         }
       }
     }
 
     const finalMsg =
-      'تلاش‌های متعدد برای ترجمه این بسته ناموفق بود. با دکمه «تکمیل موارد ناقص» می‌توانید دوباره امتحان کنید.';
+      'تلاش‌های متعدد برای ترجمه این بسته ناموفق بود. لطفاً وضعیت کلیدها را در ابزار عیب‌یابی «گزارش‌ها» بررسی کرده و سپس «تکمیل موارد ناقص» را بزنید.';
     this.markBatchError(params.file.id, params.batch, finalMsg);
     return false;
   }

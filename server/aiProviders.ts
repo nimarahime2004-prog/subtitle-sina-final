@@ -100,7 +100,12 @@ function isModelUnavailableOrOverloaded(err: ProviderApiError): boolean {
     lower.includes('high demand') ||
     lower.includes('overloaded') ||
     lower.includes('not_found') ||
-    lower.includes('not found')
+    lower.includes('not found') ||
+    (err.statusCode === 429 &&
+      (lower.includes('limit: 0') ||
+        lower.includes('limit\": 0') ||
+        lower.includes('limit":0') ||
+        lower.includes('free_tier')))
   );
 }
 
@@ -566,14 +571,13 @@ export async function translateBatchWithProvider(
       const apiErr =
         err instanceof ProviderApiError ? err : classifyGeminiError(err);
 
-      // Automatic instant fallback from gemini-3.5-flash-lite -> gemini-3.1-flash-lite on 503 UNAVAILABLE / high demand / model failure
+      // Automatic instant fallback from gemini-3.5-flash-lite -> gemini-3.1-flash-lite on 503 UNAVAILABLE / high demand / model failure / model limit:0
       if (
         shouldTryGeminiFallback(configuredModel) &&
         !apiErr.isAuthError &&
-        !apiErr.isRateLimit &&
         isModelUnavailableOrOverloaded(apiErr)
       ) {
-        if (isPrimary35) {
+        if (isPrimary35 && apiErr.statusCode >= 500) {
           gemini35SpikeUntilMs = Date.now() + 120_000;
         }
         req.onProgressNote?.(
@@ -758,7 +762,6 @@ export async function testProviderConnection(
         if (
           shouldTryGeminiFallback(modelName) &&
           !apiErr.isAuthError &&
-          !apiErr.isRateLimit &&
           isModelUnavailableOrOverloaded(apiErr)
         ) {
           const fallbackRes = await ai.models.generateContent({

@@ -1366,29 +1366,44 @@ apiRouter.patch('/providers/:id', (req, res) => {
         : Math.max(1, body.rpmLimit)
       : existing.rpm_limit;
 
+  const keyReplaced = body.apiKey !== undefined && body.apiKey.trim() !== '';
+  const nextStatus = keyReplaced
+    ? 'untested'
+    : body.clearCooldown
+      ? 'healthy'
+      : existing.status;
+  const nextEnabled =
+    body.enabled !== undefined
+      ? body.enabled
+        ? 1
+        : 0
+      : keyReplaced
+        ? 1
+        : existing.enabled;
+  const nextLastError = keyReplaced || body.clearCooldown ? null : existing.last_error;
+
   db.prepare(
     `UPDATE api_providers
      SET name = ?, base_url = ?, api_key = ?, model_name = ?,
          priority = ?, rpm_limit = ?, tpm_limit = ?, timeout_ms = ?,
          enabled = ?, input_price_per_1m = ?, output_price_per_1m = ?,
-         status = ?, cooldown_until = ?
+         status = ?, cooldown_until = ?, last_error = ?
      WHERE id = ?`
   ).run(
     body.name?.trim() || existing.name,
     body.baseUrl !== undefined ? body.baseUrl.trim() : existing.base_url,
-    body.apiKey !== undefined && body.apiKey.trim() !== ''
-      ? body.apiKey.trim()
-      : existing.api_key,
+    keyReplaced ? body.apiKey!.trim() : existing.api_key,
     body.modelName?.trim() || existing.model_name,
     body.priority ?? existing.priority,
     nextRpm,
     body.tpmLimit ?? existing.tpm_limit,
     body.timeoutMs ?? existing.timeout_ms,
-    body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
+    nextEnabled,
     body.inputPricePer1M ?? existing.input_price_per_1m,
     body.outputPricePer1M ?? existing.output_price_per_1m,
-    body.clearCooldown ? 'healthy' : existing.status,
-    body.clearCooldown ? null : existing.cooldown_until,
+    nextStatus,
+    keyReplaced || body.clearCooldown ? null : existing.cooldown_until,
+    nextLastError,
     id
   );
 
@@ -1396,6 +1411,82 @@ apiRouter.patch('/providers/:id', (req, res) => {
     .prepare(`SELECT * FROM api_providers WHERE id = ?`)
     .get(id) as unknown as ProviderRow;
   res.json(mapProviderPublic(updated));
+});
+
+apiRouter.post('/providers/cleanup-errors', (req, res) => {
+  const { action, providerIds } = req.body as {
+    action?: 'disable_errors' | 'delete_errors' | 'clear_cooldowns';
+    providerIds?: number[];
+  };
+
+  if (action === 'clear_cooldowns') {
+    const info = db
+      .prepare(
+        `UPDATE api_providers
+         SET status = 'healthy', cooldown_until = NULL
+         WHERE status = 'cooldown'`
+      )
+      .run();
+    addLog({
+      level: 'info',
+      category: 'api',
+      message: `استراحت (Cooldown) تعداد ${Number(info.changes || 0)} سرویس API پاکسازی و مجدداً آماده ارسال شد.`,
+    });
+    res.json({ ok: true, affected: Number(info.changes || 0) });
+    return;
+  }
+
+  if (action === 'disable_errors') {
+    const info =
+      Array.isArray(providerIds) && providerIds.length > 0
+        ? db
+            .prepare(
+              `UPDATE api_providers
+               SET enabled = 0
+               WHERE provider_type != 'gemini_builtin' AND id IN (${providerIds.map(() => '?').join(',')})`
+            )
+            .run(...providerIds)
+        : db
+            .prepare(
+              `UPDATE api_providers
+               SET enabled = 0
+               WHERE provider_type != 'gemini_builtin' AND status = 'error'`
+            )
+            .run();
+    addLog({
+      level: 'info',
+      category: 'api',
+      message: `${Number(info.changes || 0)} کلید خراب/مسدود به‌صورت یکجا غیرفعال شد.`,
+    });
+    res.json({ ok: true, affected: Number(info.changes || 0) });
+    return;
+  }
+
+  if (action === 'delete_errors') {
+    const info =
+      Array.isArray(providerIds) && providerIds.length > 0
+        ? db
+            .prepare(
+              `DELETE FROM api_providers
+               WHERE provider_type != 'gemini_builtin' AND id IN (${providerIds.map(() => '?').join(',')})`
+            )
+            .run(...providerIds)
+        : db
+            .prepare(
+              `DELETE FROM api_providers
+               WHERE provider_type != 'gemini_builtin' AND status = 'error'`
+            )
+            .run();
+    addLog({
+      level: 'info',
+      category: 'api',
+      message: `${Number(info.changes || 0)} کلید خراب/تعلیق‌شده از لیست APIها حذف شد.`,
+    });
+    res.json({ ok: true, affected: Number(info.changes || 0) });
+    return;
+  }
+
+  res.status(400).json({ error: 'عملیات درخواستی معتبر نیست.' });
 });
 
 apiRouter.delete('/providers/:id', (req, res) => {
@@ -1424,9 +1515,10 @@ apiRouter.post('/providers/:id/test', async (req, res) => {
   const result = await testProviderConnection(row);
   db.prepare(
     `UPDATE api_providers
-     SET status = ?, last_latency_ms = ?, last_error = ?, cooldown_until = NULL
+     SET status = ?, enabled = CASE WHEN ? = 1 THEN 1 ELSE enabled END,
+         last_latency_ms = ?, last_error = ?, cooldown_until = NULL
      WHERE id = ?`
-  ).run(result.ok ? 'healthy' : 'error', result.latencyMs, result.error ?? null, id);
+  ).run(result.ok ? 'healthy' : 'error', result.ok ? 1 : 0, result.latencyMs, result.error ?? null, id);
 
   addLog({
     level: result.ok ? 'success' : 'error',
