@@ -28,6 +28,7 @@ import {
   type ProviderRow,
 } from './db.ts';
 import {
+  clearProviderRouteCache,
   DEFAULT_BASE_URLS,
   DEFAULT_GEMINI_MODEL,
   fetchProviderModels,
@@ -1407,6 +1408,10 @@ apiRouter.patch('/providers/:id', (req, res) => {
     id
   );
 
+  if (keyReplaced || body.modelName || body.clearCooldown) {
+    clearProviderRouteCache(id);
+  }
+
   const updated = db
     .prepare(`SELECT * FROM api_providers WHERE id = ?`)
     .get(id) as unknown as ProviderRow;
@@ -1420,6 +1425,7 @@ apiRouter.post('/providers/cleanup-errors', (req, res) => {
   };
 
   if (action === 'clear_cooldowns') {
+    clearProviderRouteCache();
     const info = db
       .prepare(
         `UPDATE api_providers

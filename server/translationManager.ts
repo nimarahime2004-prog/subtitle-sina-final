@@ -140,12 +140,14 @@ class AntiBlockRateLimiter {
   recordRateLimit(providerId: number, retryAfterSec?: number): number {
     const count = (this.consecutive429.get(providerId) ?? 0) + 1;
     this.consecutive429.set(providerId, count);
-    // Step down pacing speed automatically for this key so it stays below block threshold
+    // Step down pacing speed gently for this key so it stays below block threshold
     const currMult = this.throttleMultiplier.get(providerId) ?? 1.0;
-    this.throttleMultiplier.set(providerId, Math.min(3.0, currMult * 1.45));
+    this.throttleMultiplier.set(providerId, Math.min(2.6, currMult * 1.3));
 
-    const expCooldownSec = Math.min(300, 60 * Math.pow(2, count - 1));
-    return Math.max(retryAfterSec ?? 0, expCooldownSec);
+    // Progressive cooldown: 1st transient 429 = 25s, 2nd = 60s, 3rd = 120s, 4th+ = 240s
+    const progressiveSec =
+      count === 1 ? 25 : count === 2 ? 60 : count === 3 ? 120 : 240;
+    return Math.max(retryAfterSec ? retryAfterSec + 2 : 0, progressiveSec);
   }
 }
 
@@ -879,7 +881,7 @@ class TranslationQueueManager {
             fileId: params.file.id,
             providerName: provider.name,
             modelName: result.modelUsed,
-            message: `مدل ${result.fallbackFromModel} با خطای 503/شلوغی مواجه شد — سوئیچ خودکار به ${result.modelUsed} با موفقیت انجام شد.`,
+            message: `مدل ${result.fallbackFromModel} با محدودیت یا شلوغی (429/503) مواجه شد — سوئیچ خودکار به ${result.modelUsed} با موفقیت انجام شد.`,
           });
         }
 
@@ -927,6 +929,16 @@ class TranslationQueueManager {
             modelName: provider.model_name,
             message: `محدودیت نرخ یا سهمیه (429) در «${provider.name}» — استراحت ایمن ${cooldownSec} ثانیه‌ای و سوئیچ خودکار به API بعدی.`,
           });
+
+          // Gentle anti-IP-burst pause before switching to another account from the same local IP
+          if (!this.isStopping()) {
+            const switchDelayMs = 1200 + Math.floor(Math.random() * 600);
+            this.setWorkerNote(
+              params.file.id,
+              `سوئیچ ایمن به کلید بعدی (جلوگیری از محدودیت هم‌زمان IP)...`
+            );
+            await sleep(switchDelayMs);
+          }
         } else if (apiErr.isAuthError) {
           // Quarantine permanent 401/403 (e.g., CONSUMER_SUSPENDED / API_KEY_INVALID) out of active rotation
           // Keep builtin enabled=1 only in case env key changes, but status='error' excludes it from getHealthyProviders

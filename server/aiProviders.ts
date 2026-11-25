@@ -88,29 +88,98 @@ const VALID_GEMINI_MODELS = [
 // Tracks temporary 503/UNAVAILABLE demand spikes on gemini-3.5-flash-lite (auto-recovers after 2 min)
 let gemini35SpikeUntilMs = 0;
 
-function isModelUnavailableOrOverloaded(err: ProviderApiError): boolean {
+interface CachedGeminiRoute {
+  vertexai: boolean;
+  model: string;
+  expiresAt: number;
+}
+
+// Remembers the proven working (endpoint + model) pair per provider ID to avoid wasted 429/404 probes
+const providerRouteCache = new Map<number, CachedGeminiRoute>();
+
+export function clearProviderRouteCache(providerId?: number): void {
+  if (providerId !== undefined) {
+    providerRouteCache.delete(providerId);
+  } else {
+    providerRouteCache.clear();
+  }
+}
+
+function isProjectSuspended(err: ProviderApiError): boolean {
   const lower = err.message.toLowerCase();
   return (
+    lower.includes('consumer_suspended') ||
+    lower.includes('has been suspended')
+  );
+}
+
+function isModelOrRouteRetryable(err: ProviderApiError): boolean {
+  const lower = err.message.toLowerCase();
+  return (
+    err.statusCode === 429 ||
     err.statusCode === 503 ||
     err.statusCode === 500 ||
     err.statusCode === 502 ||
     err.statusCode === 504 ||
     err.statusCode === 404 ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('quota') ||
     lower.includes('unavailable') ||
     lower.includes('high demand') ||
     lower.includes('overloaded') ||
     lower.includes('not_found') ||
-    lower.includes('not found') ||
-    (err.statusCode === 429 &&
-      (lower.includes('limit: 0') ||
-        lower.includes('limit\": 0') ||
-        lower.includes('limit":0') ||
-        lower.includes('free_tier')))
+    lower.includes('not found')
   );
 }
 
-function shouldTryGeminiFallback(primaryModel: string): boolean {
-  return primaryModel.trim().toLowerCase() !== FALLBACK_GEMINI_MODEL;
+function buildGeminiRouteCandidates(
+  provider: ProviderRow,
+  configuredModel: string
+): Array<{ vertexai: boolean; model: string }> {
+  const isAqKey =
+    provider.provider_type === 'gemini' &&
+    (provider.api_key || '').trim().startsWith('AQ.');
+  const isPrimary35 = configuredModel.trim().toLowerCase() === DEFAULT_GEMINI_MODEL;
+  const preferFallbackNow = isPrimary35 && Date.now() < gemini35SpikeUntilMs;
+
+  const primaryModels =
+    configuredModel.trim().toLowerCase() === FALLBACK_GEMINI_MODEL
+      ? [FALLBACK_GEMINI_MODEL]
+      : preferFallbackNow
+        ? [FALLBACK_GEMINI_MODEL, configuredModel]
+        : [configuredModel, FALLBACK_GEMINI_MODEL];
+
+  const rawList: Array<{ vertexai: boolean; model: string }> = [];
+
+  // 1. Always try the previously proven working route for this exact key first
+  const cached = providerRouteCache.get(provider.id);
+  if (cached && cached.expiresAt > Date.now()) {
+    rawList.push({ vertexai: cached.vertexai, model: cached.model });
+  }
+
+  // 2. For AQ. keys (Vertex AI Express Mode / new Google Cloud keys), try Vertex AI Express first,
+  //    then fall back to Gemini Developer API (generativelanguage.googleapis.com) — with 3.5 -> 3.1 fallback on both!
+  if (isAqKey) {
+    for (const m of primaryModels) {
+      rawList.push({ vertexai: true, model: m });
+    }
+    for (const m of primaryModels) {
+      rawList.push({ vertexai: false, model: m });
+    }
+  } else {
+    for (const m of primaryModels) {
+      rawList.push({ vertexai: false, model: m });
+    }
+  }
+
+  // Deduplicate preserving order
+  const seen = new Set<string>();
+  return rawList.filter((item) => {
+    const key = `${item.vertexai ? 'v' : 'g'}:${item.model.toLowerCase()}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /**
@@ -131,7 +200,11 @@ function computeEffectiveTimeoutMs(
   return Math.min(900_000, configured);
 }
 
-function getGeminiClient(provider: ProviderRow, timeoutMs: number): GoogleGenAI {
+function getGeminiClient(
+  provider: ProviderRow,
+  timeoutMs: number,
+  useVertexAi = false
+): GoogleGenAI {
   const apiKey =
     provider.provider_type === 'gemini_builtin'
       ? process.env.GEMINI_API_KEY
@@ -146,6 +219,7 @@ function getGeminiClient(provider: ProviderRow, timeoutMs: number): GoogleGenAI 
   }
   return new GoogleGenAI({
     apiKey,
+    ...(useVertexAi ? { vertexai: true } : {}),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -345,7 +419,7 @@ function classifyGeminiError(err: unknown): ProviderApiError {
       statusCode: 429,
       isRateLimit: true,
       retryable: true,
-      retryAfterSec: retryAfterSec ?? 65,
+      retryAfterSec,
     });
   }
   if (
@@ -490,10 +564,12 @@ export async function translateBatchWithProvider(
     req.provider.provider_type === 'gemini_builtin' ||
     req.provider.provider_type === 'gemini'
   ) {
-    const ai = getGeminiClient(req.provider, effectiveTimeoutMs);
     const configuredModel = (req.provider.model_name || DEFAULT_GEMINI_MODEL).trim();
+    const isPrimary35 = configuredModel.toLowerCase() === DEFAULT_GEMINI_MODEL;
+    const candidates = buildGeminiRouteCandidates(req.provider, configuredModel);
 
-    const invokeGemini = async (targetModel: string) => {
+    const invokeGemini = async (targetModel: string, useVertexAi: boolean) => {
+      const ai = getGeminiClient(req.provider, effectiveTimeoutMs, useVertexAi);
       const supportsThinkingLevel =
         targetModel === 'gemini-4-hydrogen' ||
         targetModel === 'gemini-4-neon' ||
@@ -550,50 +626,75 @@ export async function translateBatchWithProvider(
       };
     };
 
-    // If gemini-3.5-flash-lite recently hit a 503 demand spike, use gemini-3.1-flash-lite directly during the 2-min cooldown
-    const isPrimary35 = configuredModel === DEFAULT_GEMINI_MODEL;
-    if (isPrimary35 && Date.now() < gemini35SpikeUntilMs) {
-      req.onProgressNote?.(
-        `سوئیچ موقت روی ${FALLBACK_GEMINI_MODEL} به دلیل شلوغی اخیر ${DEFAULT_GEMINI_MODEL}...`
-      );
-      try {
-        const res = await invokeGemini(FALLBACK_GEMINI_MODEL);
-        return { ...res, fallbackFromModel: configuredModel };
-      } catch (err) {
-        if (err instanceof ProviderApiError) throw err;
-        throw classifyGeminiError(err);
+    const routeErrors: Array<{ vertexai: boolean; model: string; err: ProviderApiError }> = [];
+    const failedAuthEndpoints = new Set<boolean>();
+
+    for (let idx = 0; idx < candidates.length; idx++) {
+      const route = candidates[idx];
+      if (failedAuthEndpoints.has(route.vertexai)) {
+        continue;
       }
-    }
 
-    try {
-      return await invokeGemini(configuredModel);
-    } catch (err) {
-      const apiErr =
-        err instanceof ProviderApiError ? err : classifyGeminiError(err);
+      try {
+        if (idx > 0) {
+          req.onProgressNote?.(
+            `تلاش خودکار روی ${route.model} (${route.vertexai ? 'Vertex Express' : 'Gemini API'})...`
+          );
+        }
+        const res = await invokeGemini(route.model, route.vertexai);
+        providerRouteCache.set(req.provider.id, {
+          vertexai: route.vertexai,
+          model: route.model,
+          expiresAt: Date.now() + 25 * 60_000,
+        });
+        return {
+          ...res,
+          fallbackFromModel:
+            route.model.toLowerCase() !== configuredModel.toLowerCase()
+              ? configuredModel
+              : undefined,
+        };
+      } catch (err) {
+        const apiErr =
+          err instanceof ProviderApiError ? err : classifyGeminiError(err);
+        routeErrors.push({ vertexai: route.vertexai, model: route.model, err: apiErr });
 
-      // Automatic instant fallback from gemini-3.5-flash-lite -> gemini-3.1-flash-lite on 503 UNAVAILABLE / high demand / model failure / model limit:0
-      if (
-        shouldTryGeminiFallback(configuredModel) &&
-        !apiErr.isAuthError &&
-        isModelUnavailableOrOverloaded(apiErr)
-      ) {
-        if (isPrimary35 && apiErr.statusCode >= 500) {
+        // Suspended GCP project fails everywhere — abort immediately and quarantine
+        if (isProjectSuspended(apiErr)) {
+          providerRouteCache.delete(req.provider.id);
+          throw apiErr;
+        }
+
+        if (isPrimary35 && route.model === DEFAULT_GEMINI_MODEL && apiErr.statusCode >= 500) {
           gemini35SpikeUntilMs = Date.now() + 120_000;
         }
-        req.onProgressNote?.(
-          `خطای ${apiErr.statusCode} در ${configuredModel} — سوئیچ خودکار به ${FALLBACK_GEMINI_MODEL}...`
-        );
-        try {
-          const fallbackRes = await invokeGemini(FALLBACK_GEMINI_MODEL);
-          return { ...fallbackRes, fallbackFromModel: configuredModel };
-        } catch (fbErr) {
-          if (fbErr instanceof ProviderApiError) throw fbErr;
-          throw classifyGeminiError(fbErr);
+
+        if (apiErr.isAuthError) {
+          // Skip other models on this same endpoint, but still allow trying the alternate endpoint (Vertex vs Gemini API) for AQ. keys
+          failedAuthEndpoints.add(route.vertexai);
+          continue;
+        }
+
+        if (!isModelOrRouteRetryable(apiErr)) {
+          providerRouteCache.delete(req.provider.id);
+          throw apiErr;
+        }
+
+        // Small gentle pause before trying fallback model/endpoint
+        if (idx < candidates.length - 1) {
+          await new Promise((r) => setTimeout(r, 350));
         }
       }
-
-      throw apiErr;
     }
+
+    providerRouteCache.delete(req.provider.id);
+    // Prefer surfacing rate-limit / 503 over an alternate-endpoint 403/404 so valid keys are never wrongly quarantined
+    const rateLimitErr = routeErrors.find((e) => e.err.isRateLimit)?.err;
+    if (rateLimitErr) throw rateLimitErr;
+    const nonAuthErr = routeErrors.find((e) => !e.err.isAuthError)?.err;
+    if (nonAuthErr) throw nonAuthErr;
+    throw routeErrors[routeErrors.length - 1]?.err ??
+      new ProviderApiError('خطا در برقراری ارتباط با Gemini', { statusCode: 500, retryable: true });
   }
 
   // OpenAI / DeepSeek / OpenRouter / Custom OpenAI-compatible slow-proxy tolerant engine
@@ -739,47 +840,61 @@ export async function testProviderConnection(
       provider.provider_type === 'gemini_builtin' ||
       provider.provider_type === 'gemini'
     ) {
-      const ai = getGeminiClient(provider, timeoutMs);
       const modelName = (provider.model_name || DEFAULT_GEMINI_MODEL).trim();
       const prompt =
         'Translate to crisp, direct documentary Persian (only the translation, nothing else): "Every signal leaves a trace."';
+      const candidates = buildGeminiRouteCandidates(provider, modelName);
+      const routeErrors: ProviderApiError[] = [];
+      const failedAuthEndpoints = new Set<boolean>();
 
-      try {
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: prompt,
-        });
-        const latencyMs = Date.now() - startedAt;
-        return {
-          ok: true,
-          latencyMs,
-          tokensUsed: response.usageMetadata?.totalTokenCount ?? 0,
-          modelUsed: modelName,
-          sampleReply: (response.text ?? '').trim(),
-        };
-      } catch (primaryErr) {
-        const apiErr = classifyGeminiError(primaryErr);
-        if (
-          shouldTryGeminiFallback(modelName) &&
-          !apiErr.isAuthError &&
-          isModelUnavailableOrOverloaded(apiErr)
-        ) {
-          const fallbackRes = await ai.models.generateContent({
-            model: FALLBACK_GEMINI_MODEL,
+      for (const route of candidates) {
+        if (failedAuthEndpoints.has(route.vertexai)) continue;
+        try {
+          const ai = getGeminiClient(provider, timeoutMs, route.vertexai);
+          const response = await ai.models.generateContent({
+            model: route.model,
             contents: prompt,
           });
           const latencyMs = Date.now() - startedAt;
+          providerRouteCache.set(provider.id, {
+            vertexai: route.vertexai,
+            model: route.model,
+            expiresAt: Date.now() + 25 * 60_000,
+          });
           return {
             ok: true,
             latencyMs,
-            tokensUsed: fallbackRes.usageMetadata?.totalTokenCount ?? 0,
-            modelUsed: FALLBACK_GEMINI_MODEL,
-            fallbackFromModel: modelName,
-            sampleReply: (fallbackRes.text ?? '').trim(),
+            tokensUsed: response.usageMetadata?.totalTokenCount ?? 0,
+            modelUsed: route.model,
+            fallbackFromModel:
+              route.model.toLowerCase() !== modelName.toLowerCase()
+                ? modelName
+                : undefined,
+            sampleReply: (response.text ?? '').trim(),
           };
+        } catch (err) {
+          const apiErr = classifyGeminiError(err);
+          routeErrors.push(apiErr);
+          if (isProjectSuspended(apiErr)) {
+            providerRouteCache.delete(provider.id);
+            throw apiErr;
+          }
+          if (apiErr.isAuthError) {
+            failedAuthEndpoints.add(route.vertexai);
+            continue;
+          }
+          if (!isModelOrRouteRetryable(apiErr)) {
+            throw apiErr;
+          }
         }
-        throw apiErr;
       }
+
+      providerRouteCache.delete(provider.id);
+      const preferredErr =
+        routeErrors.find((e) => e.isRateLimit) ??
+        routeErrors.find((e) => !e.isAuthError) ??
+        routeErrors[routeErrors.length - 1];
+      throw preferredErr ?? new ProviderApiError('اتصال به Gemini برقرار نشد.', { statusCode: 500 });
     }
 
     const baseUrl = (
